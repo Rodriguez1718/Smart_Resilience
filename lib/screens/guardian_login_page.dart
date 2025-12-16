@@ -1,11 +1,11 @@
-// lib/screens/guardian_login_page.dart
-
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart'; // Import Firebase Auth
-import 'package:cloud_firestore/cloud_firestore.dart'; // Import Cloud Firestore
-import 'package:smart_resilience_app/screens/main_navigation.dart'; // Ensure this path is correct
-import 'package:smart_resilience_app/screens/guardian_setup_screen.dart'; // Import GuardianSetupScreen
-import 'package:smart_resilience_app/screens/success_animation_screen.dart'; // Import SuccessAnimationScreen
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:smart_resilience_app/screens/main_navigation.dart';
+import 'package:smart_resilience_app/screens/guardian_setup_screen.dart';
+import 'package:smart_resilience_app/screens/success_animation_screen.dart';
+import 'package:smart_resilience_app/services/custom_otp_service.dart';
 
 class GuardianLoginPage extends StatefulWidget {
   const GuardianLoginPage({super.key});
@@ -17,21 +17,28 @@ class GuardianLoginPage extends StatefulWidget {
 class _GuardianLoginPageState extends State<GuardianLoginPage> {
   final TextEditingController _phoneNumberController = TextEditingController();
   final TextEditingController _otpController = TextEditingController();
-  final TextEditingController _fullNameController =
-      TextEditingController(); // For new user registration
+
+  // Note: Removed _fullNameController and related logic, as the navigation
+  // to GuardianSetupScreen now handles the profile completion outside of this page.
+
   String? _verificationId;
   bool _codeSent =
       false; // Controls whether to show OTP input or phone number input
   bool _isLoading = false; // For showing loading indicators
-  bool _needsProfileCompletion =
-      false; // NEW: To track if profile completion is needed after auth
+  int _otpCountdown = 0; // Countdown timer for OTP resend button
 
   @override
   void dispose() {
     _phoneNumberController.dispose();
     _otpController.dispose();
-    _fullNameController.dispose();
     super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // Sign out any existing user to ensure fresh login with phone number
+    FirebaseAuth.instance.signOut();
   }
 
   // Function to send OTP to the provided phone number
@@ -50,69 +57,73 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
     });
 
     try {
-      await FirebaseAuth.instance.verifyPhoneNumber(
+      // Send OTP via custom iProgsms service
+      bool otpSent = await CustomOtpService.sendOtp(
         phoneNumber: phoneNumber,
-        verificationCompleted: (PhoneAuthCredential credential) async {
-          // This callback is fired when auto-retrieval (Android) or instant verification succeeds.
-          setState(() {
-            _isLoading = false;
-          });
-          _showSnackBar('Phone number automatically verified!');
-          await _signInWithCredential(credential);
-        },
-        verificationFailed: (FirebaseAuthException e) {
-          // This callback is fired when verification fails (e.g., invalid phone number)
-          setState(() {
-            _isLoading = false;
-          });
-          print('Phone verification failed: ${e.message}');
-          _showSnackBar('Verification failed: ${e.message}');
-        },
-        codeSent: (String verificationId, int? resendToken) {
-          // This callback is fired when the SMS code is successfully sent.
-          setState(() {
-            _verificationId = verificationId;
-            _codeSent = true; // Show the OTP input field
-            _isLoading = false;
-          });
-          _showSnackBar('OTP sent to your phone.');
-        },
-        codeAutoRetrievalTimeout: (String verificationId) {
-          // This callback is fired when auto-retrieval times out.
-          setState(() {
-            _verificationId = verificationId;
-            _isLoading = false;
-          });
-          _showSnackBar('OTP auto-retrieval timed out. Please enter manually.');
-        },
-        timeout: const Duration(seconds: 60), // OTP validity period
+        fullName: 'Guardian', // Placeholder name for login
       );
+
+      if (otpSent) {
+        setState(() {
+          _codeSent = true;
+          _isLoading = false;
+          _otpCountdown = 300; // 5 minutes countdown
+          _startOtpCountdown(); // Start countdown timer
+        });
+        _showSnackBar('OTP sent to your phone. Valid for 5 minutes.');
+      } else {
+        setState(() {
+          _isLoading = false;
+        });
+        _showSnackBar('Failed to send OTP. Please try again.');
+      }
     } catch (e) {
       setState(() {
         _isLoading = false;
       });
-      print('Error sending OTP: $e');
+      debugPrint('Error sending OTP: $e');
       _showSnackBar('Error sending OTP: $e');
     }
   }
 
+  /// Start countdown timer for OTP expiration
+  void _startOtpCountdown() {
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted && _codeSent) {
+        setState(() {
+          _otpCountdown--;
+        });
+        if (_otpCountdown > 0) {
+          _startOtpCountdown();
+        }
+      }
+    });
+  }
+
   // Normalize phone number to E.164 for the Philippines (+63).
-  // Accepts inputs like:
-  // - "+639123456789" -> returned unchanged
-  // - "9123456789" -> "+639123456789"
-  // - "09123456789" -> "+639123456789"
   String _normalizePhoneNumber(String input) {
     String phone = input.trim();
     if (phone.isEmpty) return phone;
+    // Remove all non-digit characters except for a leading '+'
+    phone = phone.replaceAll(RegExp(r'[^\d+]'), '');
     if (phone.startsWith('+')) return phone;
     if (phone.startsWith('0')) phone = phone.substring(1);
-    return '+63$phone';
+    // Assuming Philippine mobile numbers (10 digits after country code 63)
+    if (phone.length == 10 && phone.startsWith('9')) {
+      return '+63$phone';
+    }
+    return '+63$phone'; // Defaulting to +63 prepended
   }
 
   // Function to verify the entered OTP
   Future<void> _verifyOtp() async {
-    if (_otpController.text.isEmpty || _verificationId == null) {
+    if (_otpController.text.isEmpty) {
       _showSnackBar('Please enter the OTP.');
+      return;
+    }
+
+    if (_otpController.text.length != 6) {
+      _showSnackBar('OTP must be 6 digits.');
       return;
     }
 
@@ -121,23 +132,92 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
     });
 
     try {
-      PhoneAuthCredential credential = PhoneAuthProvider.credential(
-        verificationId: _verificationId!,
-        smsCode: _otpController.text,
+      // Verify OTP using custom service
+      bool isValid = CustomOtpService.verifyOtp(
+        phoneNumber: _phoneNumberController.text,
+        otp: _otpController.text,
       );
-      await _signInWithCredential(credential);
-    } on FirebaseAuthException catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
-      print('Error verifying OTP: ${e.message}');
-      _showSnackBar('Invalid OTP. Please try again. ${e.message}');
+
+      if (isValid) {
+        print('[Guardian Login] OTP verified successfully');
+
+        // Clear the OTP after successful verification
+        CustomOtpService.clearOtp(_phoneNumberController.text);
+
+        // Sign in anonymously to get Firestore access
+        UserCredential anonAuth = await FirebaseAuth.instance
+            .signInAnonymously();
+        String anonUid = anonAuth.user?.uid ?? '';
+        print('[Guardian Login] Anonymous auth UID: $anonUid');
+
+        // Check if guardian profile exists
+        String normalizedPhone = _normalizePhoneNumber(
+          _phoneNumberController.text,
+        );
+
+        // Query Firestore for existing guardian with this phone
+        QuerySnapshot snapshot = await FirebaseFirestore.instance
+            .collection('guardians')
+            .where('phoneNumber', isEqualTo: normalizedPhone)
+            .limit(1)
+            .get();
+
+        if (snapshot.docs.isNotEmpty) {
+          // Existing guardian found
+          String userId = snapshot.docs.first.id;
+          final guardianData =
+              snapshot.docs.first.data() as Map<String, dynamic>?;
+          String? userName = guardianData?['fullName'] as String?;
+
+          print('[Guardian Login] Found guardian document with ID: $userId');
+
+          // Save to local storage for future use
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('guardianDocId', userId);
+          await prefs.setString('guardianPhoneNumber', normalizedPhone);
+          print('[Guardian Login] Saved guardian ID to local storage: $userId');
+
+          // Update lastLogin with the guardian's actual document ID
+          await FirebaseFirestore.instance
+              .collection('guardians')
+              .doc(userId)
+              .set({
+                'lastLogin': FieldValue.serverTimestamp(),
+              }, SetOptions(merge: true));
+
+          print('[Guardian Login] Existing guardian found: $userId');
+          _showSnackBar('Welcome back, ${userName ?? 'User'}!');
+          if (mounted) {
+            Navigator.of(context).pushReplacement(
+              MaterialPageRoute(
+                builder: (context) => const SuccessAnimationScreen(),
+              ),
+            );
+          }
+        } else {
+          // New guardian - redirect to setup screen
+          print('[Guardian Login] No guardian found, redirecting to setup');
+          _showSnackBar('Profile not found. Please complete setup.');
+          if (mounted) {
+            Navigator.of(context).pushReplacement(
+              MaterialPageRoute(
+                builder: (context) => const GuardianSetupScreen(),
+              ),
+            );
+          }
+        }
+      } else {
+        setState(() {
+          _isLoading = false;
+        });
+        _showSnackBar('Invalid or expired OTP. Please try again.');
+      }
     } catch (e) {
       setState(() {
         _isLoading = false;
       });
-      print('Error during OTP verification: $e');
-      _showSnackBar('An unexpected error occurred during OTP verification.');
+      debugPrint('Error during OTP verification: $e');
+      _showSnackBar('An unexpected error occurred: $e');
     }
   }
 
@@ -157,24 +237,20 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
 
         final data = userDoc.data() as Map<String, dynamic>?;
 
-        // Determine if profile completion is needed
-        if (!userDoc.exists ||
-            data == null ||
-            !data.containsKey('fullName') ||
-            data['fullName'] == null) {
+        // Determine if profile completion is needed (checking for 'fullName')
+        if (!userDoc.exists || data == null || data['fullName'] == null) {
           // Profile is incomplete or doesn't exist, redirect to setup/completion
           _showSnackBar('Welcome! Please complete your profile.');
           if (mounted) {
             // Redirect to GuardianSetupScreen to complete profile
             Navigator.of(context).pushReplacement(
               MaterialPageRoute(
-                builder: (context) =>
-                    const GuardianSetupScreen(), // This screen will handle profile completion
+                builder: (context) => const GuardianSetupScreen(),
               ),
             );
           }
         } else {
-          // Existing user with a complete profile: update last login and navigate to SuccessAnimationScreen
+          // Existing user with a complete profile: update last login and navigate
           await FirebaseFirestore.instance
               .collection('guardians')
               .doc(user.uid)
@@ -186,7 +262,7 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
               data['fullName'] as String?; // Safely access fullName
           _showSnackBar('Welcome back, ${userName ?? 'User'}!');
           if (mounted) {
-            // CHANGED: Navigate to SuccessAnimationScreen instead of MainNavigation directly
+            // Navigate to SuccessAnimationScreen
             Navigator.of(context).pushReplacement(
               MaterialPageRoute(
                 builder: (context) =>
@@ -197,93 +273,11 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
         }
       }
     } on FirebaseAuthException catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
-      print('Firebase Auth Error after sign-in: ${e.message}');
+      debugPrint('Firebase Auth Error after sign-in: ${e.message}');
       _showSnackBar('Authentication failed: ${e.message}');
     } catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
-      print('Error signing in with credential: $e');
+      debugPrint('Error signing in with credential: $e');
       _showSnackBar('An unexpected error occurred during sign-in.');
-    } finally {
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  // This method is for saving the full name ONLY when _needsProfileCompletion is true
-  // It's called from within this page's UI when the user enters their name.
-  Future<void> _saveProfileAndNavigate() async {
-    if (_fullNameController.text.isEmpty) {
-      _showSnackBar('Please enter your full name.');
-      return;
-    }
-
-    setState(() {
-      _isLoading = true;
-    });
-
-    try {
-      User? user = FirebaseAuth.instance.currentUser;
-      if (user == null) {
-        _showSnackBar('Error: No authenticated user found.');
-        setState(() {
-          _isLoading = false;
-        });
-        return;
-      }
-
-      // Update the existing guardian profile document with the full name
-      await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(user.uid)
-          .set({
-            'fullName': _fullNameController.text.trim(),
-            'phoneNumber':
-                user.phoneNumber ??
-                _normalizePhoneNumber(_phoneNumberController.text.trim()),
-            // Ensure phone number is also saved/updated (normalized to +63...)
-            'lastLogin': FieldValue.serverTimestamp(),
-            'hasCompletedSetup': true, // Mark setup as complete
-          }, SetOptions(merge: true));
-
-      // Ensure subcollections exist for the new user
-      await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(user.uid)
-          .collection('geofences')
-          .doc('initial_geofence_placeholder') // Using a placeholder document
-          .set({
-            'createdAt': FieldValue.serverTimestamp(),
-            'isPlaceholder': true,
-          }, SetOptions(merge: true));
-
-      await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(user.uid)
-          .collection('settings')
-          .doc('initial_settings_placeholder') // Using a placeholder document
-          .set({
-            'createdAt': FieldValue.serverTimestamp(),
-            'isPlaceholder': true,
-          }, SetOptions(merge: true));
-
-      _showSnackBar('Profile saved successfully! Welcome!');
-      if (mounted) {
-        // Navigate to success animation after profile is fully saved
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (context) => const SuccessAnimationScreen(),
-          ),
-        );
-      }
-    } catch (e) {
-      print('Error saving new guardian profile: $e');
-      _showSnackBar('Failed to save profile: $e');
     } finally {
       setState(() {
         _isLoading = false;
@@ -309,9 +303,8 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
         children: [
           _buildLoginContentCard(), // Main content wrapped in a card
           const SizedBox(height: 24),
-          // "Don't have an account?" button, only visible if not in profile completion flow
-          if (!_needsProfileCompletion &&
-              !_codeSent) // Only show if not in OTP or profile completion
+          // "Don't have an account?" button
+          if (!_codeSent) // Only show if not in OTP
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
@@ -403,11 +396,9 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            _needsProfileCompletion
-                ? "Complete Your Profile"
-                : "Guardian Login",
-            style: const TextStyle(
+          const Text(
+            "Guardian Login",
+            style: TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.bold,
               color: Colors.black87,
@@ -415,29 +406,85 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
           ),
           const SizedBox(height: 4),
           Text(
-            _needsProfileCompletion
-                ? "Please provide your full name to complete setup."
-                : (_codeSent
-                      ? "Enter the OTP sent to your phone."
-                      : "Enter your phone number to receive an OTP."),
+            _codeSent
+                ? "Enter the OTP sent to your phone."
+                : "Enter your phone number to receive an OTP. (Philippines +63)",
             style: TextStyle(color: Colors.grey[600], fontSize: 13),
           ),
           const SizedBox(height: 24),
-          if (_needsProfileCompletion) ...[
-            // UI for new user to enter full name after successful phone auth
+
+          // UI for phone number and OTP input
+          _buildTextField(
+            controller: _phoneNumberController,
+            labelText: "Phone Number",
+            hintText: "e.g., 9123456789 (no leading 0)",
+            keyboardType: TextInputType.phone,
+            enabled:
+                !_codeSent, // Disable if code sent to prevent changing number
+            prefixText: '+63 ',
+          ),
+          const SizedBox(height: 16),
+
+          if (_codeSent) ...[
             _buildTextField(
-              controller: _fullNameController,
-              labelText: "Full Name",
-              hintText: "Enter your full name",
-              enabled: true, // Always enabled for profile completion
+              controller: _otpController,
+              labelText: "OTP",
+              hintText: "Enter 6-digit code",
+              keyboardType: TextInputType.number,
+              maxLength: 6,
+            ),
+            const SizedBox(height: 8),
+            // Countdown timer info
+            Text(
+              _otpCountdown > 0
+                  ? 'OTP expires in ${(_otpCountdown ~/ 60)}:${(_otpCountdown % 60).toString().padLeft(2, '0')}'
+                  : 'OTP expired',
+              style: TextStyle(
+                color: _otpCountdown > 30 ? Colors.grey[600] : Colors.red,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 32),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: _isLoading
-                    ? null
-                    : _saveProfileAndNavigate, // Call new save method
+                onPressed: _isLoading ? null : _verifyOtp,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor:
+                      Colors.blue.shade500, // Different color for verify
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  elevation: 3,
+                ),
+                child: _isLoading
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : const Text(
+                        "Verify OTP",
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+              ),
+            ),
+            // Resend OTP button
+            TextButton(
+              onPressed: (_isLoading || _otpCountdown > 0) ? null : _sendOtp,
+              child: Text(
+                _otpCountdown > 0
+                    ? 'Resend in ${(_otpCountdown ~/ 60)}:${(_otpCountdown % 60).toString().padLeft(2, '0')}'
+                    : 'Resend OTP',
+              ),
+            ),
+          ] else ...[
+            // Initial state: only phone number and send OTP button
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _isLoading ? null : _sendOtp,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.green.shade500,
                   foregroundColor: Colors.white,
@@ -450,7 +497,7 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
                 child: _isLoading
                     ? const CircularProgressIndicator(color: Colors.white)
                     : const Text(
-                        "Complete Setup",
+                        "Send OTP",
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
@@ -458,83 +505,6 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
                       ),
               ),
             ),
-          ] else ...[
-            // UI for phone number and OTP input
-            _buildTextField(
-              controller: _phoneNumberController,
-              labelText: "Phone Number",
-              hintText: "e.g., 9123456789 (no leading 0)",
-              keyboardType: TextInputType.phone,
-              enabled:
-                  !_codeSent, // Disable if code sent to prevent changing number
-              prefixText: '+63 ',
-            ),
-            const SizedBox(height: 16),
-            if (_codeSent) ...[
-              _buildTextField(
-                controller: _otpController,
-                labelText: "OTP",
-                hintText: "Enter 6-digit code",
-                keyboardType: TextInputType.number,
-              ),
-              const SizedBox(height: 32),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _isLoading ? null : _verifyOtp,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor:
-                        Colors.blue.shade500, // Different color for verify
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    elevation: 3,
-                  ),
-                  child: _isLoading
-                      ? const CircularProgressIndicator(color: Colors.white)
-                      : const Text(
-                          "Verify OTP",
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                ),
-              ),
-              // Optional: Resend OTP button
-              TextButton(
-                onPressed: _isLoading ? null : _sendOtp, // Allow resend
-                child: const Text('Resend OTP'),
-              ),
-            ] else ...[
-              // Initial state: only phone number and send OTP button
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: _isLoading ? null : _sendOtp,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green.shade500,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    elevation: 3,
-                  ),
-                  child: _isLoading
-                      ? const CircularProgressIndicator(color: Colors.white)
-                      : const Text(
-                          "Send OTP",
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                ),
-              ),
-            ],
           ],
         ],
       ),
@@ -549,14 +519,16 @@ class _GuardianLoginPageState extends State<GuardianLoginPage> {
     TextInputType keyboardType = TextInputType.text,
     bool enabled = true, // Added enabled parameter for consistency
     String? prefixText,
+    int? maxLength,
   }) {
     return TextField(
       controller: controller,
       keyboardType: keyboardType,
       enabled: enabled, // Apply enabled state
+      maxLength: maxLength,
       decoration: InputDecoration(
         prefixText: prefixText,
-        prefixStyle: TextStyle(color: Colors.black87),
+        prefixStyle: const TextStyle(color: Colors.black87),
         labelText: labelText,
         hintText: hintText,
         border: OutlineInputBorder(

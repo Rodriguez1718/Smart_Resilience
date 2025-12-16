@@ -1,15 +1,13 @@
 // lib/screens/location_history_screen.dart
 
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:intl/intl.dart'; // For date formatting
-import 'package:smart_resilience_app/screens/profile_page.dart'; // Import ProfilePage
-import 'package:smart_resilience_app/widgets/profile_avatar.dart';
 import 'package:smart_resilience_app/screens/route_map_screen.dart'; // Screen to display the route on a map
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async'; // Import for StreamSubscription
 
 class LocationHistoryScreen extends StatefulWidget {
@@ -19,20 +17,26 @@ class LocationHistoryScreen extends StatefulWidget {
   State<LocationHistoryScreen> createState() => _LocationHistoryScreenState();
 }
 
-class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
+class _LocationHistoryScreenState extends State<LocationHistoryScreen>
+    with TickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<AlignmentGeometry> _animation;
   User? _currentUser;
-  String? _currentUserName; // To store the user's full name for the AppBar
-  String? _currentUserPhotoUrl; // To store the user's profile photo URL
+  String? _currentUserName; // NEW: To store the user's full name for the AppBar
   List<Map<String, dynamic>> _locationLogs = [];
   bool _isLoading = true;
   DateTime _selectedDate = DateTime.now(); // Default to today
   String? _selectedChildId; // To filter logs by child
   List<Map<String, dynamic>> _children =
       []; // List of children (fetched from Firestore or hardcoded)
+  String? _guardianDocId; // Store guardian document ID
+  String? _pairedDeviceId; // Store paired device ID
+  String? _childName; // Store child name
 
   StreamSubscription<User?>?
   _authStateSubscription; // Declare nullable subscription
-  StreamSubscription<DocumentSnapshot>? _profileDocSubscription;
+  StreamSubscription<DatabaseEvent>?
+  _trackingHistorySubscription; // NEW: Real-time tracking history subscription
 
   @override
   void initState() {
@@ -40,56 +44,81 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
     _authStateSubscription = FirebaseAuth.instance.authStateChanges().listen((
       user,
     ) async {
-      if (!mounted) return;
-      setState(() {
-        _currentUser = user;
-        // Attempt to get display name from Firebase Auth, or set a default
-        _currentUserName = user?.displayName ?? user?.phoneNumber ?? 'Guardian';
-      });
-
-      // Cancel any existing profile doc subscription
-      await _profileDocSubscription?.cancel();
-
-      if (user != null) {
-        // Listen to guardian document so profile changes propagate to all screens
-        _profileDocSubscription = FirebaseFirestore.instance
-            .collection('guardians')
-            .doc(user.uid)
-            .snapshots()
-            .listen((snapshot) {
-              if (!mounted) return;
-              if (snapshot.exists && snapshot.data() != null) {
-                final data = snapshot.data() as Map<String, dynamic>;
-                setState(() {
-                  _currentUserName =
-                      data['fullName'] ?? user.phoneNumber ?? 'Guardian';
-                  _currentUserPhotoUrl = data['photoUrl'] as String?;
-                });
-              }
-            });
-
-        _fetchChildren(); // Fetch children and then load logs
-      } else {
-        // User logged out, clear data
+      if (mounted) {
         setState(() {
-          _locationLogs = [];
-          _children = [];
-          _selectedChildId = null;
-          _currentUserName = null;
-          _currentUserPhotoUrl = null;
-          _isLoading = false;
+          _currentUser = user;
+          // Attempt to get display name from Firebase Auth, or set a default
+          _currentUserName =
+              user?.displayName ?? user?.phoneNumber ?? 'Guardian';
         });
+
+        if (user != null) {
+          // Fetch user's full name from Firestore profile, similar to HomeScreen
+          DocumentSnapshot guardianDoc = await FirebaseFirestore.instance
+              .collection('guardians')
+              .doc(user.uid)
+              .get();
+          if (guardianDoc.exists && guardianDoc.data() != null) {
+            final data = guardianDoc.data() as Map<String, dynamic>;
+            setState(() {
+              _currentUserName =
+                  data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+            });
+          }
+          _fetchChildren(); // Fetch children and then load logs
+        } else {
+          // User logged out, clear data
+          setState(() {
+            _locationLogs = [];
+            _children = [];
+            _selectedChildId = null;
+            _currentUserName = null;
+            _isLoading = false;
+          });
+        }
       }
     });
     // Gradient animation setup (copied from SettingsScreen)
-    // No background animation: we'll use a static gradient (same as HomeScreen)
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 20),
+    )..repeat(reverse: true);
+
+    _animation =
+        Tween<AlignmentGeometry>(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ).animate(
+          CurvedAnimation(
+            parent: _animationController,
+            curve: Curves.easeInOut,
+          ),
+        );
   }
 
   @override
   void dispose() {
     _authStateSubscription?.cancel(); // Cancel the subscription
-    _profileDocSubscription?.cancel(); // Cancel profile doc listener
+    _trackingHistorySubscription
+        ?.cancel(); // NEW: Cancel tracking history subscription
+    _animationController.dispose(); // Dispose animation controller
     super.dispose();
+  }
+
+  // NEW: Load guardian document ID from local storage
+  Future<void> _loadGuardianDocId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final docId = prefs.getString('guardianDocId');
+      if (docId != null && docId.isNotEmpty) {
+        setState(() {
+          _guardianDocId = docId;
+        });
+        print('✅ LocationHistoryScreen: Loaded guardian doc ID: $docId');
+      }
+    } catch (e) {
+      print('❌ LocationHistoryScreen: Error loading guardian doc ID: $e');
+    }
   }
 
   // Fetches children associated with the current guardian
@@ -103,21 +132,55 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
     }
 
     try {
-      // For now, using hardcoded children. In a real app, you'd fetch this
-      // from a 'children' subcollection under the guardian's document.
-      // Example: guardians/{guardianId}/children/{childId}
-      setState(() {
-        _children = [
-          {'id': 'alex_id', 'name': 'Alex'},
-          {'id': 'bea_id', 'name': 'Bea'},
-        ];
-        // Set first child as selected by default, or handle no children case
-        if (_children.isNotEmpty && _selectedChildId == null) {
-          // Only set if not already selected
-          _selectedChildId = _children.first['id'];
+      // Load guardian doc ID first
+      await _loadGuardianDocId();
+
+      if (_guardianDocId == null) {
+        // Fallback: try using user.uid
+        _guardianDocId = _currentUser!.uid;
+      }
+
+      // Load paired device from Firestore
+      final deviceDoc = await FirebaseFirestore.instance
+          .collection('guardians')
+          .doc(_guardianDocId!)
+          .collection('paired_device')
+          .doc('device_info')
+          .get();
+
+      if (deviceDoc.exists && deviceDoc.data() != null) {
+        final deviceId = deviceDoc.data()!['deviceId'] as String?;
+        final childName = deviceDoc.data()!['childName'] as String?;
+
+        if (deviceId != null && deviceId.isNotEmpty) {
+          setState(() {
+            _pairedDeviceId = deviceId;
+            _childName = childName;
+            _children = [
+              {'id': deviceId, 'name': childName ?? 'Child'},
+            ];
+            // Set the paired device as selected
+            if (_selectedChildId == null) {
+              _selectedChildId = deviceId;
+            }
+          });
+
+          // Subscribe to real-time tracking history
+          _subscribeToTrackingHistory(deviceId);
+        } else {
+          // No device paired
+          setState(() {
+            _children = [];
+            _isLoading = false;
+          });
         }
-      });
-      _loadLocationLogs(); // Load logs after children are fetched
+      } else {
+        // No device paired
+        setState(() {
+          _children = [];
+          _isLoading = false;
+        });
+      }
     } catch (e) {
       print("Error fetching children: $e");
       setState(() {
@@ -131,9 +194,118 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
     }
   }
 
+  // NEW: Subscribe to real-time tracking history from Firebase Realtime Database
+  void _subscribeToTrackingHistory(String deviceId) {
+    _trackingHistorySubscription?.cancel();
+
+    final db = FirebaseDatabase.instance;
+    final trackingHistoryRef = db.ref('trackingHistory/$deviceId');
+
+    _trackingHistorySubscription = trackingHistoryRef.onValue.listen(
+      (DatabaseEvent event) {
+        if (!mounted) return;
+
+        print('📍 Real-time tracking history update received');
+
+        if (!event.snapshot.exists) {
+          setState(() {
+            _locationLogs = [];
+            _isLoading = false;
+          });
+          return;
+        }
+
+        final data = event.snapshot.value as Map<dynamic, dynamic>?;
+        if (data == null) {
+          setState(() {
+            _locationLogs = [];
+            _isLoading = false;
+          });
+          return;
+        }
+
+        // Process all location records
+        final allLogs = <Map<String, dynamic>>[];
+
+        data.forEach((timestamp, locationData) {
+          if (locationData is Map) {
+            final lat = locationData['lat'] as double? ?? 0.0;
+            final lng = locationData['lng'] as double? ?? 0.0;
+            final battery = locationData['battery'] as int? ?? 0;
+            final ts = int.tryParse(timestamp.toString()) ?? 0;
+
+            if (lat != 0.0 || lng != 0.0) {
+              allLogs.add({
+                'id': timestamp.toString(),
+                'latitude': lat,
+                'longitude': lng,
+                'timestamp': DateTime.fromMillisecondsSinceEpoch(ts),
+                'childName': _childName ?? 'Child',
+                'battery': battery,
+              });
+            }
+          }
+        });
+
+        // Filter by selected date
+        _filterLogsByDate(allLogs);
+      },
+      onError: (error) {
+        print("Error listening to tracking history: $error");
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+          });
+        }
+      },
+    );
+  }
+
+  // NEW: Filter logs by selected date
+  void _filterLogsByDate(List<Map<String, dynamic>> allLogs) {
+    final startOfDay = DateTime(
+      _selectedDate.year,
+      _selectedDate.month,
+      _selectedDate.day,
+    );
+    final endOfDay = DateTime(
+      _selectedDate.year,
+      _selectedDate.month,
+      _selectedDate.day,
+      23,
+      59,
+      59,
+    );
+
+    final filteredLogs = allLogs.where((log) {
+      final logDate = log['timestamp'] as DateTime;
+      return logDate.isAfter(startOfDay.subtract(const Duration(seconds: 1))) &&
+          logDate.isBefore(endOfDay.add(const Duration(seconds: 1)));
+    }).toList();
+
+    // Sort by timestamp (oldest first for route display)
+    filteredLogs.sort(
+      (a, b) =>
+          (a['timestamp'] as DateTime).compareTo(b['timestamp'] as DateTime),
+    );
+
+    setState(() {
+      _locationLogs = filteredLogs;
+      _isLoading = false;
+    });
+
+    print(
+      '✅ Filtered ${filteredLogs.length} logs for ${DateFormat('MMM d, yyyy').format(_selectedDate)}',
+    );
+  }
+
   // Loads location logs for the selected child and date
+  // NOTE: This method is now mainly used to trigger a refresh when date/child changes
+  // The actual data loading happens via real-time subscription in _subscribeToTrackingHistory
   Future<void> _loadLocationLogs() async {
-    if (_currentUser == null || _selectedChildId == null) {
+    if (_currentUser == null ||
+        _selectedChildId == null ||
+        _pairedDeviceId == null) {
       setState(() {
         _isLoading = false;
         _locationLogs = [];
@@ -141,178 +313,10 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
       return;
     }
 
-    setState(() {
-      _isLoading = true;
-      _locationLogs = []; // Clear previous logs
-    });
-
-    try {
-      // Define the start and end of the selected day
-      DateTime startOfDay = DateTime(
-        _selectedDate.year,
-        _selectedDate.month,
-        _selectedDate.day,
-      );
-      DateTime endOfDay = DateTime(
-        _selectedDate.year,
-        _selectedDate.month,
-        _selectedDate.day,
-        23,
-        59,
-        59,
-      );
-
-      // This part is for actual Firestore data. For mock data, it won't be used.
-      // If you switch back to real data, uncomment this:
-      /*
-      QuerySnapshot snapshot = await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(_currentUser!.uid)
-          .collection('children') // Assuming a 'children' collection
-          .doc(_selectedChildId) // Specific child's document
-          .collection('location_logs') // Subcollection for location logs
-          .where('timestamp', isGreaterThanOrEqualTo: startOfDay)
-          .where('timestamp', isLessThanOrEqualTo: endOfDay)
-          .orderBy('timestamp', descending: false) // Order by time for route drawing
-          .get();
-
-      setState(() {
-        _locationLogs = snapshot.docs.map((doc) {
-          final data = doc.data() as Map<String, dynamic>;
-          Timestamp timestamp = data['timestamp'] as Timestamp;
-          return {
-            'id': doc.id,
-            'latitude': data['latitude'],
-            'longitude': data['longitude'],
-            'timestamp': timestamp.toDate(), // Convert Firestore Timestamp to Dart DateTime
-            'childName': data['childName'] ?? 'Unknown Child',
-          };
-        }).toList();
-      });
-      */
-
-      // --- MOCK DATA FOR DEMONSTRATION (replace with Firestore fetch when ready) ---
-      // This is the mock data that will be used for now.
-      List<Map<String, dynamic>> mockLogs = [];
-      if (_selectedChildId == 'alex_id') {
-        mockLogs = [
-          {
-            'id': 'log1',
-            'latitude': 10.6667,
-            'longitude': 122.95,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              8,
-              0,
-            ),
-            'childName': 'Alex',
-          },
-          {
-            'id': 'log2',
-            'latitude': 10.6680,
-            'longitude': 122.9510,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              8,
-              30,
-            ),
-            'childName': 'Alex',
-          },
-          {
-            'id': 'log3',
-            'latitude': 10.6695,
-            'longitude': 122.9530,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              9,
-              0,
-            ),
-            'childName': 'Alex',
-          },
-          {
-            'id': 'log4',
-            'latitude': 10.6670,
-            'longitude': 122.9550,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              9,
-              45,
-            ),
-            'childName': 'Alex',
-          },
-          {
-            'id': 'log5',
-            'latitude': 10.6650,
-            'longitude': 122.9545,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              10,
-              15,
-            ),
-            'childName': 'Alex',
-          },
-        ];
-      } else if (_selectedChildId == 'bea_id') {
-        mockLogs = [
-          {
-            'id': 'log6',
-            'latitude': 10.6650,
-            'longitude': 122.9480,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              11,
-              0,
-            ),
-            'childName': 'Bea',
-          },
-          {
-            'id': 'log7',
-            'latitude': 10.6660,
-            'longitude': 122.9490,
-            'timestamp': DateTime(
-              _selectedDate.year,
-              _selectedDate.month,
-              _selectedDate.day,
-              11,
-              30,
-            ),
-            'childName': 'Bea',
-          },
-        ];
-      }
-      // Sort mock logs by timestamp to ensure correct route order
-      mockLogs.sort(
-        (a, b) =>
-            (a['timestamp'] as DateTime).compareTo(b['timestamp'] as DateTime),
-      );
-
-      setState(() {
-        _locationLogs = mockLogs;
-      });
-      // --- END MOCK DATA ---
-    } catch (e) {
-      print("Error loading location logs: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error loading location logs: $e")),
-        );
-      }
-    } finally {
-      setState(() {
-        _isLoading = false;
-      });
+    // If we already have a subscription, it will automatically update
+    // Just trigger a refresh by re-subscribing
+    if (_pairedDeviceId != null) {
+      _subscribeToTrackingHistory(_pairedDeviceId!);
     }
   }
 
@@ -377,7 +381,69 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
       setState(() {
         _selectedDate = picked;
       });
-      _loadLocationLogs(); // Reload logs for the new date
+      // Re-filter existing logs for the new date
+      // The subscription will continue to update in real-time
+      if (_pairedDeviceId != null) {
+        // Trigger a refresh by getting current data and filtering
+        _refreshLocationLogs();
+      }
+    }
+  }
+
+  // NEW: Refresh location logs by fetching current data and filtering
+  Future<void> _refreshLocationLogs() async {
+    if (_pairedDeviceId == null) return;
+
+    try {
+      final snapshot = await FirebaseDatabase.instance
+          .ref('trackingHistory/$_pairedDeviceId')
+          .get();
+
+      if (!snapshot.exists) {
+        setState(() {
+          _locationLogs = [];
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final data = snapshot.value as Map<dynamic, dynamic>?;
+      if (data == null) {
+        setState(() {
+          _locationLogs = [];
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final allLogs = <Map<String, dynamic>>[];
+
+      data.forEach((timestamp, locationData) {
+        if (locationData is Map) {
+          final lat = locationData['lat'] as double? ?? 0.0;
+          final lng = locationData['lng'] as double? ?? 0.0;
+          final battery = locationData['battery'] as int? ?? 0;
+          final ts = int.tryParse(timestamp.toString()) ?? 0;
+
+          if (lat != 0.0 || lng != 0.0) {
+            allLogs.add({
+              'id': timestamp.toString(),
+              'latitude': lat,
+              'longitude': lng,
+              'timestamp': DateTime.fromMillisecondsSinceEpoch(ts),
+              'childName': _childName ?? 'Child',
+              'battery': battery,
+            });
+          }
+        }
+      });
+
+      _filterLogsByDate(allLogs);
+    } catch (e) {
+      print("Error refreshing location logs: $e");
+      setState(() {
+        _isLoading = false;
+      });
     }
   }
 
@@ -411,18 +477,24 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
 
     return Scaffold(
       appBar: _buildAppBar(initial), // Pass the initial for the avatar
-      body: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [
-              Colors.green.shade100,
-              Colors.blue.shade100,
-              Colors.green.shade50,
-            ],
-          ),
-        ),
+      body: AnimatedBuilder(
+        animation: _animation,
+        builder: (context, child) {
+          return Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: _animation.value,
+                end: _animation.value * -1,
+                colors: [
+                  Colors.green.shade100,
+                  Colors.blue.shade100,
+                  Colors.green.shade50,
+                ],
+              ),
+            ),
+            child: child,
+          );
+        },
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
@@ -517,29 +589,13 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
         // User avatar, dynamically displaying initial
         Padding(
           padding: const EdgeInsets.only(right: 16.0),
-          child: ProfileAvatar(
-            photoPath: _currentUserPhotoUrl,
-            displayName: _currentUserName,
+          child: CircleAvatar(
+            backgroundColor: Colors.deepPurple[400],
             radius: 18,
-            onProfileUpdated: (updated) async {
-              if (updated == true) {
-                final user = FirebaseAuth.instance.currentUser;
-                if (user != null) {
-                  final doc = await FirebaseFirestore.instance
-                      .collection('guardians')
-                      .doc(user.uid)
-                      .get();
-                  if (doc.exists && doc.data() != null) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    setState(() {
-                      _currentUserName =
-                          data['fullName'] ?? user.phoneNumber ?? 'Guardian';
-                      _currentUserPhotoUrl = data['photoUrl'] as String?;
-                    });
-                  }
-                }
-              }
-            },
+            child: Text(
+              initial, // Use the dynamically determined initial
+              style: const TextStyle(color: Colors.white, fontSize: 16),
+            ),
           ),
         ),
       ],
@@ -636,7 +692,10 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
               setState(() {
                 _selectedChildId = newValue;
               });
-              _loadLocationLogs(); // Reload logs for the new child
+              // Re-subscribe to tracking history for the new device
+              if (newValue != null) {
+                _subscribeToTrackingHistory(newValue);
+              }
             },
             items: _children.map<DropdownMenuItem<String>>((
               Map<String, dynamic> child,
