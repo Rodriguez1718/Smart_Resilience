@@ -4,10 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:intl/intl.dart'; // For date formatting
-import 'package:smart_resilience_app/screens/route_map_screen.dart'; // Screen to display the route on a map
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:smart_resilience_app/widgets/profile_avatar.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'dart:async'; // Import for StreamSubscription
 
 class LocationHistoryScreen extends StatefulWidget {
@@ -17,95 +18,102 @@ class LocationHistoryScreen extends StatefulWidget {
   State<LocationHistoryScreen> createState() => _LocationHistoryScreenState();
 }
 
-class _LocationHistoryScreenState extends State<LocationHistoryScreen>
-    with TickerProviderStateMixin {
-  late AnimationController _animationController;
-  late Animation<AlignmentGeometry> _animation;
+class _LocationHistoryScreenState extends State<LocationHistoryScreen> {
   User? _currentUser;
-  String? _currentUserName; // NEW: To store the user's full name for the AppBar
+  String? _guardianDocId; // Store the actual guardian document ID
+  String? _currentUserName; // To store the user's full name for the AppBar
+  String? _currentUserPhotoUrl; // To store the user's profile photo URL
+  String? _childName; // NEW: Store the child's name
   List<Map<String, dynamic>> _locationLogs = [];
   bool _isLoading = true;
-  DateTime _selectedDate = DateTime.now(); // Default to today
-  String? _selectedChildId; // To filter logs by child
-  List<Map<String, dynamic>> _children =
-      []; // List of children (fetched from Firestore or hardcoded)
-  String? _guardianDocId; // Store guardian document ID
-  String? _pairedDeviceId; // Store paired device ID
-  String? _childName; // Store child name
+  String? _deviceId; // Device ID (loaded from Firestore)
+
+  // NEW: Route simulation variables
+  bool _isSimulatingRoute = false;
+  List<LatLng> _routePoints = [];
+  LatLng? _currentSimulatedLocation;
+  int _currentRouteIndex = 0;
+  Timer? _simulationTimer;
+  final MapController _routeMapController = MapController();
+
+  // Date and time filter variables
+  DateTime? _selectedStartDate;
+  DateTime? _selectedEndDate;
+  TimeOfDay? _selectedStartTime;
+  TimeOfDay? _selectedEndTime;
+
+  // NEW: Collapsible date sections tracking
+  Set<String> _expandedDateSections = {};
 
   StreamSubscription<User?>?
   _authStateSubscription; // Declare nullable subscription
-  StreamSubscription<DatabaseEvent>?
-  _trackingHistorySubscription; // NEW: Real-time tracking history subscription
+  StreamSubscription<DocumentSnapshot>? _profileDocSubscription;
 
   @override
   void initState() {
     super.initState();
+    _loadGuardianDocId();
     _authStateSubscription = FirebaseAuth.instance.authStateChanges().listen((
       user,
     ) async {
-      if (mounted) {
-        setState(() {
-          _currentUser = user;
-          // Attempt to get display name from Firebase Auth, or set a default
-          _currentUserName =
-              user?.displayName ?? user?.phoneNumber ?? 'Guardian';
-        });
+      if (!mounted) return;
+      setState(() {
+        _currentUser = user;
+        // Attempt to get display name from Firebase Auth, or set a default
+        _currentUserName = user?.displayName ?? user?.phoneNumber ?? 'Guardian';
+      });
 
-        if (user != null) {
-          // Fetch user's full name from Firestore profile, similar to HomeScreen
-          DocumentSnapshot guardianDoc = await FirebaseFirestore.instance
-              .collection('guardians')
-              .doc(user.uid)
-              .get();
-          if (guardianDoc.exists && guardianDoc.data() != null) {
-            final data = guardianDoc.data() as Map<String, dynamic>;
-            setState(() {
-              _currentUserName =
-                  data['fullName'] ?? user.phoneNumber ?? 'Guardian';
-            });
-          }
-          _fetchChildren(); // Fetch children and then load logs
-        } else {
-          // User logged out, clear data
+      // Cancel any existing profile doc subscription
+      await _profileDocSubscription?.cancel();
+
+      if (user != null) {
+        // Load guardian doc ID from local storage
+        final prefs = await SharedPreferences.getInstance();
+        final guardianDocId = prefs.getString('guardianDocId');
+
+        if (guardianDocId != null && guardianDocId.isNotEmpty) {
           setState(() {
-            _locationLogs = [];
-            _children = [];
-            _selectedChildId = null;
-            _currentUserName = null;
-            _isLoading = false;
+            _guardianDocId = guardianDocId;
           });
+          print(
+            '✅ LocationHistoryScreen: Loaded guardian doc ID: $guardianDocId',
+          );
+
+          // Listen to guardian document so profile changes propagate to all screens
+          _profileDocSubscription = FirebaseFirestore.instance
+              .collection('guardians')
+              .doc(guardianDocId)
+              .snapshots()
+              .listen((snapshot) {
+                if (!mounted) return;
+                if (snapshot.exists && snapshot.data() != null) {
+                  final data = snapshot.data() as Map<String, dynamic>;
+                  setState(() {
+                    _currentUserName =
+                        data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+                    _currentUserPhotoUrl = data['photoUrl'] as String?;
+                  });
+                }
+              });
+
+          // NEW: Load paired device info (device ID and child name)
+          await _loadPairedDevice(guardianDocId);
         }
+      } else {
+        // User logged out, clear data
+        setState(() {
+          _locationLogs = [];
+          _currentUserName = null;
+          _currentUserPhotoUrl = null;
+          _guardianDocId = null;
+          _isLoading = false;
+        });
       }
     });
     // Gradient animation setup (copied from SettingsScreen)
-    _animationController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 20),
-    )..repeat(reverse: true);
-
-    _animation =
-        Tween<AlignmentGeometry>(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ).animate(
-          CurvedAnimation(
-            parent: _animationController,
-            curve: Curves.easeInOut,
-          ),
-        );
+    // No background animation: we'll use a static gradient (same as HomeScreen)
   }
 
-  @override
-  void dispose() {
-    _authStateSubscription?.cancel(); // Cancel the subscription
-    _trackingHistorySubscription
-        ?.cancel(); // NEW: Cancel tracking history subscription
-    _animationController.dispose(); // Dispose animation controller
-    super.dispose();
-  }
-
-  // NEW: Load guardian document ID from local storage
   Future<void> _loadGuardianDocId() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -121,191 +129,48 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
     }
   }
 
-  // Fetches children associated with the current guardian
-  Future<void> _fetchChildren() async {
-    if (_currentUser == null) {
-      setState(() {
-        _isLoading = false;
-        _children = [];
-      });
-      return;
-    }
+  @override
+  void dispose() {
+    _authStateSubscription?.cancel(); // Cancel the subscription
+    _profileDocSubscription?.cancel(); // Cancel profile doc listener
+    _simulationTimer?.cancel(); // Cancel route simulation timer
+    super.dispose();
+  }
 
+  // NEW: Load paired device info (device ID and child name)
+  Future<void> _loadPairedDevice(String userId) async {
     try {
-      // Load guardian doc ID first
-      await _loadGuardianDocId();
-
-      if (_guardianDocId == null) {
-        // Fallback: try using user.uid
-        _guardianDocId = _currentUser!.uid;
-      }
-
-      // Load paired device from Firestore
       final deviceDoc = await FirebaseFirestore.instance
           .collection('guardians')
-          .doc(_guardianDocId!)
+          .doc(userId)
           .collection('paired_device')
           .doc('device_info')
           .get();
 
       if (deviceDoc.exists && deviceDoc.data() != null) {
-        final deviceId = deviceDoc.data()!['deviceId'] as String?;
-        final childName = deviceDoc.data()!['childName'] as String?;
+        final data = deviceDoc.data() as Map<String, dynamic>;
+        final deviceId = data['deviceId'] as String?;
+        final childName = data['childName'] as String?;
 
         if (deviceId != null && deviceId.isNotEmpty) {
           setState(() {
-            _pairedDeviceId = deviceId;
+            _deviceId = deviceId;
             _childName = childName;
-            _children = [
-              {'id': deviceId, 'name': childName ?? 'Child'},
-            ];
-            // Set the paired device as selected
-            if (_selectedChildId == null) {
-              _selectedChildId = deviceId;
-            }
           });
-
-          // Subscribe to real-time tracking history
-          _subscribeToTrackingHistory(deviceId);
-        } else {
-          // No device paired
-          setState(() {
-            _children = [];
-            _isLoading = false;
-          });
+          _loadLocationLogs(); // Load logs after getting device ID
         }
-      } else {
-        // No device paired
-        setState(() {
-          _children = [];
-          _isLoading = false;
-        });
       }
     } catch (e) {
-      print("Error fetching children: $e");
+      print("Error loading paired device: $e");
       setState(() {
         _isLoading = false;
       });
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Error fetching children: $e")));
-      }
     }
   }
 
-  // NEW: Subscribe to real-time tracking history from Firebase Realtime Database
-  void _subscribeToTrackingHistory(String deviceId) {
-    _trackingHistorySubscription?.cancel();
-
-    final db = FirebaseDatabase.instance;
-    final trackingHistoryRef = db.ref('trackingHistory/$deviceId');
-
-    _trackingHistorySubscription = trackingHistoryRef.onValue.listen(
-      (DatabaseEvent event) {
-        if (!mounted) return;
-
-        print('📍 Real-time tracking history update received');
-
-        if (!event.snapshot.exists) {
-          setState(() {
-            _locationLogs = [];
-            _isLoading = false;
-          });
-          return;
-        }
-
-        final data = event.snapshot.value as Map<dynamic, dynamic>?;
-        if (data == null) {
-          setState(() {
-            _locationLogs = [];
-            _isLoading = false;
-          });
-          return;
-        }
-
-        // Process all location records
-        final allLogs = <Map<String, dynamic>>[];
-
-        data.forEach((timestamp, locationData) {
-          if (locationData is Map) {
-            final lat = locationData['lat'] as double? ?? 0.0;
-            final lng = locationData['lng'] as double? ?? 0.0;
-            final battery = locationData['battery'] as int? ?? 0;
-            final ts = int.tryParse(timestamp.toString()) ?? 0;
-
-            if (lat != 0.0 || lng != 0.0) {
-              allLogs.add({
-                'id': timestamp.toString(),
-                'latitude': lat,
-                'longitude': lng,
-                'timestamp': DateTime.fromMillisecondsSinceEpoch(ts),
-                'childName': _childName ?? 'Child',
-                'battery': battery,
-              });
-            }
-          }
-        });
-
-        // Filter by selected date
-        _filterLogsByDate(allLogs);
-      },
-      onError: (error) {
-        print("Error listening to tracking history: $error");
-        if (mounted) {
-          setState(() {
-            _isLoading = false;
-          });
-        }
-      },
-    );
-  }
-
-  // NEW: Filter logs by selected date
-  void _filterLogsByDate(List<Map<String, dynamic>> allLogs) {
-    final startOfDay = DateTime(
-      _selectedDate.year,
-      _selectedDate.month,
-      _selectedDate.day,
-    );
-    final endOfDay = DateTime(
-      _selectedDate.year,
-      _selectedDate.month,
-      _selectedDate.day,
-      23,
-      59,
-      59,
-    );
-
-    final filteredLogs = allLogs.where((log) {
-      final logDate = log['timestamp'] as DateTime;
-      return logDate.isAfter(startOfDay.subtract(const Duration(seconds: 1))) &&
-          logDate.isBefore(endOfDay.add(const Duration(seconds: 1)));
-    }).toList();
-
-    // Sort by timestamp (oldest first for route display)
-    filteredLogs.sort(
-      (a, b) =>
-          (a['timestamp'] as DateTime).compareTo(b['timestamp'] as DateTime),
-    );
-
-    setState(() {
-      _locationLogs = filteredLogs;
-      _isLoading = false;
-    });
-
-    print(
-      '✅ Filtered ${filteredLogs.length} logs for ${DateFormat('MMM d, yyyy').format(_selectedDate)}',
-    );
-  }
-
-  // Loads location logs for the selected child and date
-  // NOTE: This method is now mainly used to trigger a refresh when date/child changes
-  // The actual data loading happens via real-time subscription in _subscribeToTrackingHistory
+  // Loads location logs from the tracking history
   Future<void> _loadLocationLogs() async {
-    if (_currentUser == null ||
-        _selectedChildId == null ||
-        _pairedDeviceId == null) {
+    if (_currentUser == null || _deviceId == null) {
       setState(() {
         _isLoading = false;
         _locationLogs = [];
@@ -313,55 +178,103 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
       return;
     }
 
-    // If we already have a subscription, it will automatically update
-    // Just trigger a refresh by re-subscribing
-    if (_pairedDeviceId != null) {
-      _subscribeToTrackingHistory(_pairedDeviceId!);
-    }
-  }
-
-  // Function to simulate adding a location log (for testing)
-  Future<void> _addSimulatedLog() async {
-    if (_currentUser == null || _selectedChildId == null) {
-      _showSnackBar('Select a child first.');
-      return;
-    }
-
     setState(() {
       _isLoading = true;
+      _locationLogs = []; // Clear previous logs
     });
 
     try {
-      // Simulate a random location around Bacolod City
-      // LatLng(10.6667, 122.95)
-      double baseLat = 10.6667;
-      double baseLng = 122.95;
-      double randomLatOffset =
-          (DateTime.now().second % 100 - 50) / 10000.0; // Small random movement
-      double randomLngOffset =
-          (DateTime.now().minute % 100 - 50) / 10000.0; // Small random movement
+      // Read from Realtime Database path: /trackingHistory/{deviceId}
+      // This contains timestamped location records
+      final db = FirebaseDatabase.instance;
+      final ref = db.ref('trackingHistory/$_deviceId');
+      final snapshot = await ref.get();
 
-      // This part is for actual Firestore data. For mock data, it won't be used.
-      // If you switch back to real data, uncomment this:
-      /*
-      await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(_currentUser!.uid)
-          .collection('children')
-          .doc(_selectedChildId)
-          .collection('location_logs')
-          .add({
-            'latitude': baseLat + randomLatOffset,
-            'longitude': baseLng + randomLngOffset,
-            'timestamp': FieldValue.serverTimestamp(),
-            'childName': _children.firstWhere((c) => c['id'] == _selectedChildId)['name'],
+      List<Map<String, dynamic>> logs = [];
+
+      print('📍 Fetching location history from trackingHistory/$_deviceId');
+
+      if (snapshot.exists && snapshot.value != null) {
+        final value = snapshot.value;
+        print('📊 Raw data type: ${value.runtimeType}');
+
+        if (value is Map) {
+          // Iterate through all timestamped records
+          value.forEach((timestamp, record) {
+            try {
+              if (record is Map) {
+                final entry = Map<String, dynamic>.from(record);
+                int ts = 0;
+
+                // Try to parse timestamp key directly
+                if (timestamp is String) {
+                  ts = int.tryParse(timestamp) ?? 0;
+                } else if (timestamp is int) {
+                  ts = timestamp;
+                }
+
+                // Fallback to timestamp in data if key parsing fails
+                if (ts == 0) {
+                  final tsRaw = entry['timestamp'];
+                  if (tsRaw is int) {
+                    ts = tsRaw;
+                  } else if (tsRaw is String) {
+                    ts = int.tryParse(tsRaw) ?? 0;
+                  }
+                }
+
+                // Convert seconds -> ms if necessary
+                if (ts > 0 && ts < 10000000000) ts = ts * 1000;
+
+                if (ts > 0) {
+                  final dt = DateTime.fromMillisecondsSinceEpoch(ts);
+                  final lat =
+                      double.tryParse(entry['lat']?.toString() ?? '') ?? 0.0;
+                  final lng =
+                      double.tryParse(entry['lng']?.toString() ?? '') ?? 0.0;
+
+                  if (lat != 0.0 || lng != 0.0) {
+                    logs.add({
+                      'id': 'tracking_${ts}',
+                      'latitude': lat,
+                      'longitude': lng,
+                      'timestamp': dt,
+                      'childName': _childName ?? _deviceId ?? 'Device',
+                      'battery': entry['battery'] ?? 0,
+                    });
+                    print(
+                      '  ✅ Location: $lat, $lng @ ${dt.toString()} (Battery: ${entry['battery']}%)',
+                    );
+                  }
+                }
+              }
+            } catch (e) {
+              print('  ⚠️ Error parsing record $timestamp: $e');
+            }
           });
-      */
-      _showSnackBar('Simulated log added!');
-      _loadLocationLogs(); // Reload logs after adding
+        }
+      } else {
+        print('⚠️ No data found at trackingHistory/$_deviceId');
+        print('   Make sure location tracking is active to build history');
+      }
+
+      // Sort by timestamp (oldest first) so animation plays chronologically
+      logs.sort(
+        (a, b) =>
+            (a['timestamp'] as DateTime).compareTo(b['timestamp'] as DateTime),
+      );
+
+      print('✅ Loaded ${logs.length} total location records');
+      setState(() {
+        _locationLogs = logs;
+      });
     } catch (e) {
-      print("Error adding simulated log: $e");
-      _showSnackBar("Error adding simulated log: $e");
+      print("❌ Error loading location logs from RTDB: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error loading location logs: $e")),
+        );
+      }
     } finally {
       setState(() {
         _isLoading = false;
@@ -369,82 +282,100 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
     }
   }
 
-  // Function to show date picker
-  Future<void> _selectDate(BuildContext context) async {
+  Future<void> _selectDate() async {
     final DateTime? picked = await showDatePicker(
       context: context,
-      initialDate: _selectedDate,
-      firstDate: DateTime(2023, 1),
+      firstDate: DateTime(2023),
       lastDate: DateTime.now(),
+      initialDate: _selectedStartDate ?? DateTime.now(),
     );
-    if (picked != null && picked != _selectedDate) {
+    if (picked != null) {
       setState(() {
-        _selectedDate = picked;
+        _selectedStartDate = picked;
+        _selectedEndDate =
+            picked; // Set end date to same day for single date selection
       });
-      // Re-filter existing logs for the new date
-      // The subscription will continue to update in real-time
-      if (_pairedDeviceId != null) {
-        // Trigger a refresh by getting current data and filtering
-        _refreshLocationLogs();
-      }
     }
   }
 
-  // NEW: Refresh location logs by fetching current data and filtering
-  Future<void> _refreshLocationLogs() async {
-    if (_pairedDeviceId == null) return;
-
-    try {
-      final snapshot = await FirebaseDatabase.instance
-          .ref('trackingHistory/$_pairedDeviceId')
-          .get();
-
-      if (!snapshot.exists) {
-        setState(() {
-          _locationLogs = [];
-          _isLoading = false;
-        });
-        return;
-      }
-
-      final data = snapshot.value as Map<dynamic, dynamic>?;
-      if (data == null) {
-        setState(() {
-          _locationLogs = [];
-          _isLoading = false;
-        });
-        return;
-      }
-
-      final allLogs = <Map<String, dynamic>>[];
-
-      data.forEach((timestamp, locationData) {
-        if (locationData is Map) {
-          final lat = locationData['lat'] as double? ?? 0.0;
-          final lng = locationData['lng'] as double? ?? 0.0;
-          final battery = locationData['battery'] as int? ?? 0;
-          final ts = int.tryParse(timestamp.toString()) ?? 0;
-
-          if (lat != 0.0 || lng != 0.0) {
-            allLogs.add({
-              'id': timestamp.toString(),
-              'latitude': lat,
-              'longitude': lng,
-              'timestamp': DateTime.fromMillisecondsSinceEpoch(ts),
-              'childName': _childName ?? 'Child',
-              'battery': battery,
-            });
-          }
-        }
-      });
-
-      _filterLogsByDate(allLogs);
-    } catch (e) {
-      print("Error refreshing location logs: $e");
+  Future<void> _selectStartTime() async {
+    final TimeOfDay? picked = await showTimePicker(
+      context: context,
+      initialTime: _selectedStartTime ?? TimeOfDay.now(),
+    );
+    if (picked != null) {
       setState(() {
-        _isLoading = false;
+        _selectedStartTime = picked;
       });
     }
+  }
+
+  Future<void> _selectEndTime() async {
+    final TimeOfDay? picked = await showTimePicker(
+      context: context,
+      initialTime: _selectedEndTime ?? TimeOfDay.now(),
+    );
+    if (picked != null) {
+      setState(() {
+        _selectedEndTime = picked;
+      });
+    }
+  }
+
+  void _clearDateTimeFilters() {
+    setState(() {
+      _selectedStartDate = null;
+      _selectedEndDate = null;
+      _selectedStartTime = null;
+      _selectedEndTime = null;
+    });
+  }
+
+  bool _isLocationInDateTimeRange(Map<String, dynamic> log) {
+    if (_selectedStartDate == null &&
+        _selectedEndDate == null &&
+        _selectedStartTime == null &&
+        _selectedEndTime == null) {
+      return true; // No filters applied
+    }
+
+    final logDateTime = log['timestamp'] as DateTime;
+
+    // Check date range
+    if (_selectedStartDate != null &&
+        logDateTime.isBefore(_selectedStartDate!)) {
+      return false;
+    }
+    if (_selectedEndDate != null) {
+      final endOfDay = _selectedEndDate!.add(const Duration(days: 1));
+      if (logDateTime.isAfter(endOfDay)) {
+        return false;
+      }
+    }
+
+    // Check time range
+    if (_selectedStartTime != null || _selectedEndTime != null) {
+      final logTime = TimeOfDay.fromDateTime(logDateTime);
+      final logMinutes = logTime.hour * 60 + logTime.minute;
+
+      if (_selectedStartTime != null) {
+        final startMinutes =
+            _selectedStartTime!.hour * 60 + _selectedStartTime!.minute;
+        if (logMinutes < startMinutes) {
+          return false;
+        }
+      }
+
+      if (_selectedEndTime != null) {
+        final endMinutes =
+            _selectedEndTime!.hour * 60 + _selectedEndTime!.minute;
+        if (logMinutes > endMinutes) {
+          return false;
+        }
+      }
+    }
+
+    return true;
   }
 
   void _showSnackBar(String message) {
@@ -453,6 +384,100 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
         context,
       ).showSnackBar(SnackBar(content: Text(message)));
     }
+  }
+
+  // NEW: Start route simulation with selected date or all logs
+  void _startRouteSimulation() {
+    // Determine which logs to simulate
+    late List<Map<String, dynamic>> logsToSimulate;
+
+    if (_selectedStartDate != null) {
+      // If a start date is selected, use only logs from that date
+      final selectedDay = _selectedStartDate!;
+      final dayStart = DateTime(
+        selectedDay.year,
+        selectedDay.month,
+        selectedDay.day,
+      );
+      final dayEnd = DateTime(
+        selectedDay.year,
+        selectedDay.month,
+        selectedDay.day,
+        23,
+        59,
+        59,
+      );
+
+      logsToSimulate = _locationLogs.where((log) {
+        final logTime = log['timestamp'] as DateTime;
+        return logTime.isAfter(dayStart) && logTime.isBefore(dayEnd);
+      }).toList();
+    } else {
+      // If no date is selected, use all logs
+      logsToSimulate = _locationLogs;
+    }
+
+    if (logsToSimulate.isEmpty) {
+      final dateStr = _selectedStartDate != null
+          ? DateFormat('MMM d, yyyy').format(_selectedStartDate!)
+          : 'today';
+      _showSnackBar('No location data available for $dateStr');
+      return;
+    }
+
+    // Extract route points from selected logs
+    final routePoints = logsToSimulate
+        .map((log) => LatLng(log['latitude'], log['longitude']))
+        .toList();
+
+    setState(() {
+      _isSimulatingRoute = true;
+      _routePoints = routePoints;
+      _currentRouteIndex = 0;
+      _currentSimulatedLocation = routePoints.isNotEmpty
+          ? routePoints[0]
+          : null;
+    });
+
+    // Start timer to animate through route
+    _simulationTimer?.cancel();
+    _simulationTimer = Timer.periodic(const Duration(milliseconds: 500), (
+      timer,
+    ) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
+      setState(() {
+        if (_currentRouteIndex < _routePoints.length - 1) {
+          _currentRouteIndex++;
+          _currentSimulatedLocation = _routePoints[_currentRouteIndex];
+
+          // Move map to follow device
+          try {
+            _routeMapController.move(_currentSimulatedLocation!, 16.0);
+          } catch (e) {
+            // ignore map controller errors
+          }
+        } else {
+          // Simulation finished
+          timer.cancel();
+          _showSnackBar('Route simulation completed');
+        }
+      });
+    });
+  }
+
+  // NEW: Stop route simulation
+  void _stopRouteSimulation() {
+    _simulationTimer?.cancel();
+    setState(() {
+      _isSimulatingRoute = false;
+      _routePoints = [];
+      _currentRouteIndex = 0;
+      _currentSimulatedLocation = null;
+    });
   }
 
   @override
@@ -470,68 +495,39 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
       }
     }
 
-    if (_currentUser == null ||
-        (_isLoading && _locationLogs.isEmpty && _children.isEmpty)) {
+    if (_currentUser == null || (_isLoading && _locationLogs.isEmpty)) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
       appBar: _buildAppBar(initial), // Pass the initial for the avatar
-      body: AnimatedBuilder(
-        animation: _animation,
-        builder: (context, child) {
-          return Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: _animation.value,
-                end: _animation.value * -1,
-                colors: [
-                  Colors.green.shade100,
-                  Colors.blue.shade100,
-                  Colors.green.shade50,
-                ],
-              ),
-            ),
-            child: child,
-          );
-        },
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Colors.green.shade100,
+              Colors.blue.shade100,
+              Colors.green.shade50,
+            ],
+          ),
+        ),
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
             _buildSectionHeader(
               title: "Location History Filter",
               description:
-                  "Select a child and date to view their movement history.",
+                  "Select a date and time to view your device's movement history.",
             ),
             const SizedBox(height: 16),
-            _buildDateFilterCard(), // Use the new card-style date filter
-            const SizedBox(height: 8),
-            _buildChildFilterCard(), // Use the new card-style child filter
+            _buildDateTimeFilterCard(), // Add date/time filter
             const SizedBox(height: 24),
+            // NEW: Route Simulation Card
+            if (_isSimulatingRoute) _buildRouteSimulationMap(),
+            if (_isSimulatingRoute) const SizedBox(height: 24),
             _buildLocationHistorySection(), // This section already has its own cards
-            const SizedBox(height: 16),
-            // Button to simulate adding a log (for testing)
-            SizedBox(
-              width: double.infinity, // Make it take full width
-              child: ElevatedButton.icon(
-                onPressed: _isLoading ? null : _addSimulatedLog,
-                icon: const Icon(Icons.add_location_alt),
-                label: const Text(
-                  "Simulate Add Location Log",
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-                ),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                      Colors.green, // Matching the green from home_screen
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  elevation: 3,
-                ),
-              ),
-            ),
           ],
         ),
       ),
@@ -589,13 +585,29 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
         // User avatar, dynamically displaying initial
         Padding(
           padding: const EdgeInsets.only(right: 16.0),
-          child: CircleAvatar(
-            backgroundColor: Colors.deepPurple[400],
+          child: ProfileAvatar(
+            photoPath: _currentUserPhotoUrl,
+            displayName: _currentUserName,
             radius: 18,
-            child: Text(
-              initial, // Use the dynamically determined initial
-              style: const TextStyle(color: Colors.white, fontSize: 16),
-            ),
+            onProfileUpdated: (updated) async {
+              if (updated == true) {
+                final user = FirebaseAuth.instance.currentUser;
+                if (user != null) {
+                  final doc = await FirebaseFirestore.instance
+                      .collection('guardians')
+                      .doc(user.uid)
+                      .get();
+                  if (doc.exists && doc.data() != null) {
+                    final data = doc.data() as Map<String, dynamic>;
+                    setState(() {
+                      _currentUserName =
+                          data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+                      _currentUserPhotoUrl = data['photoUrl'] as String?;
+                    });
+                  }
+                }
+              }
+            },
           ),
         ),
       ],
@@ -623,114 +635,393 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
     );
   }
 
-  // New: Card-style Date Filter
-  Widget _buildDateFilterCard() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 5,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          const Text(
-            "Date Filter",
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-          ),
-          TextButton(
-            onPressed: () => _selectDate(context),
-            child: Row(
-              children: [
-                Text(
-                  DateFormat('MMM d, yyyy').format(_selectedDate),
-                  style: const TextStyle(fontSize: 16, color: Colors.blue),
-                ),
-                const Icon(Icons.arrow_drop_down, color: Colors.blue),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // New: Card-style Child Filter
-  Widget _buildChildFilterCard() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.grey.withOpacity(0.1),
-            spreadRadius: 1,
-            blurRadius: 5,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          const Text(
-            "Select Child",
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-          ),
-          DropdownButton<String>(
-            value: _selectedChildId,
-            onChanged: (String? newValue) {
-              setState(() {
-                _selectedChildId = newValue;
-              });
-              // Re-subscribe to tracking history for the new device
-              if (newValue != null) {
-                _subscribeToTrackingHistory(newValue);
-              }
-            },
-            items: _children.map<DropdownMenuItem<String>>((
-              Map<String, dynamic> child,
-            ) {
-              return DropdownMenuItem<String>(
-                value: child['id'],
-                child: Text(child['name']),
-              );
-            }).toList(),
-            underline: Container(), // Remove default underline
-            icon: const Icon(
-              Icons.arrow_drop_down,
-              color: Colors.blue,
-            ), // Custom icon
-            style: const TextStyle(
-              fontSize: 16,
-              color: Colors.blue,
-            ), // Text style
-          ),
-        ],
-      ),
-    );
-  }
-
-  // _buildLocationHistorySection and _buildLocationLogCard remain largely the same,
-  // as they already use a card-like structure, but I'll ensure the header matches.
-  Widget _buildLocationHistorySection() {
-    String formattedDate = DateFormat('MMMM d, yyyy').format(_selectedDate);
+  // NEW: Route simulation map widget
+  Widget _buildRouteSimulationMap() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSectionHeader(
-          title: "Location Logs for $formattedDate", // Updated title
+          title: "Route Simulation",
           description:
-              "Recorded movements for ${_children.firstWhere((c) => c['id'] == _selectedChildId, orElse: () => {'name': 'selected child'})['name']}.", // Dynamic description
+              "Watch today's device route replay in real-time on the map below.",
+        ),
+        const SizedBox(height: 16),
+        Container(
+          height: 300,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.grey.withOpacity(0.1),
+                spreadRadius: 1,
+                blurRadius: 5,
+                offset: const Offset(0, 3),
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: _currentSimulatedLocation != null
+                ? FlutterMap(
+                    mapController: _routeMapController,
+                    options: MapOptions(
+                      initialCenter: _currentSimulatedLocation!,
+                      initialZoom: 16.0,
+                      interactionOptions: const InteractionOptions(
+                        flags: InteractiveFlag.all,
+                      ),
+                      maxZoom: 18.0,
+                      minZoom: 10.0,
+                    ),
+                    children: [
+                      TileLayer(
+                        urlTemplate:
+                            'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        userAgentPackageName:
+                            'com.example.smart_resilience_app',
+                        maxZoom: 18,
+                        tileDimension: 256,
+                        retinaMode: false,
+                      ),
+                      // Draw full route path
+                      if (_routePoints.isNotEmpty)
+                        PolylineLayer(
+                          polylines: [
+                            Polyline(
+                              points: _routePoints,
+                              color: Colors.lightBlue.withValues(alpha: 0.4),
+                              strokeWidth: 2,
+                            ),
+                          ],
+                        ),
+                      // Draw traveled path (up to current location)
+                      if (_currentRouteIndex > 0)
+                        PolylineLayer(
+                          polylines: [
+                            Polyline(
+                              points: _routePoints.sublist(
+                                0,
+                                _currentRouteIndex + 1,
+                              ),
+                              color: Colors.blue.withValues(alpha: 0.8),
+                              strokeWidth: 4,
+                            ),
+                          ],
+                        ),
+                      // Mark current simulated location
+                      MarkerLayer(
+                        markers: [
+                          if (_currentSimulatedLocation != null)
+                            Marker(
+                              point: _currentSimulatedLocation!,
+                              width: 40,
+                              height: 40,
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: Colors.white,
+                                    width: 3,
+                                  ),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: Colors.blue.withValues(alpha: 0.8),
+                                      blurRadius: 10,
+                                      spreadRadius: 2,
+                                    ),
+                                  ],
+                                ),
+                                child: const CircleAvatar(
+                                  backgroundColor: Colors.blue,
+                                  child: Icon(
+                                    Icons.my_location,
+                                    color: Colors.white,
+                                    size: 20,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                  )
+                : const Center(child: CircularProgressIndicator()),
+          ),
+        ),
+        const SizedBox(height: 16),
+        // Simulation controls
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: _isSimulatingRoute
+                    ? _stopRouteSimulation
+                    : _startRouteSimulation,
+                icon: Icon(_isSimulatingRoute ? Icons.stop : Icons.play_arrow),
+                label: Text(_isSimulatingRoute ? 'Stop Simulation' : 'Start'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _isSimulatingRoute
+                      ? Colors.red
+                      : Colors.green,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: _stopRouteSimulation,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Reset'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.orange,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        Text(
+          'Progress: ${_currentRouteIndex + 1}/${_routePoints.length} points',
+          style: const TextStyle(fontSize: 12, color: Colors.grey),
+        ),
+      ],
+    );
+  }
+
+  // New: Card-style Date/Time Filter
+  Widget _buildDateTimeFilterCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.1),
+            spreadRadius: 1,
+            blurRadius: 5,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Date & Time Filter',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+              if (_selectedStartDate != null ||
+                  _selectedStartTime != null ||
+                  _selectedEndTime != null)
+                TextButton(
+                  onPressed: _clearDateTimeFilters,
+                  child: const Text(
+                    'Clear All',
+                    style: TextStyle(color: Colors.red, fontSize: 14),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // Single Date Picker
+          GestureDetector(
+            onTap: _selectDate,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey.shade300),
+                borderRadius: BorderRadius.circular(8),
+                color: Colors.grey[50],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    _selectedStartDate != null
+                        ? DateFormat('MMM d, yyyy').format(_selectedStartDate!)
+                        : 'Select a Date',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: _selectedStartDate != null
+                          ? Colors.black87
+                          : Colors.grey,
+                    ),
+                  ),
+                  Icon(
+                    Icons.calendar_today,
+                    size: 20,
+                    color: _selectedStartDate != null
+                        ? Colors.blue
+                        : Colors.grey,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          // Time Range
+          Row(
+            children: [
+              Expanded(
+                child: GestureDetector(
+                  onTap: _selectStartTime,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(8),
+                      color: Colors.grey[50],
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _selectedStartTime != null
+                                ? _selectedStartTime!.format(context)
+                                : 'Start Time',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: _selectedStartTime != null
+                                  ? Colors.black87
+                                  : Colors.grey,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Icon(
+                          Icons.access_time,
+                          size: 20,
+                          color: _selectedStartTime != null
+                              ? Colors.blue
+                              : Colors.grey,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: GestureDetector(
+                  onTap: _selectEndTime,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(8),
+                      color: Colors.grey[50],
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _selectedEndTime != null
+                                ? _selectedEndTime!.format(context)
+                                : 'End Time',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: _selectedEndTime != null
+                                  ? Colors.black87
+                                  : Colors.grey,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Icon(
+                          Icons.access_time,
+                          size: 20,
+                          color: _selectedEndTime != null
+                              ? Colors.blue
+                              : Colors.grey,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLocationHistorySection() {
+    // Apply date/time filtering to location logs
+    final filteredLogs = _locationLogs
+        .where((log) => _isLocationInDateTimeRange(log))
+        .toList();
+
+    // Group logs by date
+    Map<String, List<Map<String, dynamic>>> logsByDate = {};
+    for (var log in filteredLogs) {
+      final dateKey = DateFormat('MMM d, yyyy').format(log['timestamp']);
+
+      if (!logsByDate.containsKey(dateKey)) {
+        logsByDate[dateKey] = [];
+      }
+      logsByDate[dateKey]!.add(log);
+    }
+
+    // Sort dates in descending order (newest first)
+    final sortedDates = logsByDate.keys.toList()
+      ..sort((a, b) {
+        final dateA = DateFormat('MMM d, yyyy').parse(a);
+        final dateB = DateFormat('MMM d, yyyy').parse(b);
+        return dateB.compareTo(dateA);
+      });
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Expanded(
+              child: _buildSectionHeader(
+                title: "Location Logs",
+                description: "Recorded movements for your device.",
+              ),
+            ),
+            ElevatedButton.icon(
+              onPressed: _startRouteSimulation,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Simulate'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+          ],
         ),
         const SizedBox(height: 16),
         _isLoading
@@ -754,17 +1045,134 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
                   ],
                 ),
                 alignment: Alignment.center,
-                child: Text(
-                  "No location logs found for ${DateFormat('MMM d').format(_selectedDate)} and selected child.",
-                  style: const TextStyle(color: Colors.grey),
+                child: const Text(
+                  "No location logs found.",
+                  style: TextStyle(color: Colors.grey),
+                  textAlign: TextAlign.center,
+                ),
+              )
+            : filteredLogs.isEmpty
+            ? Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 24,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.grey.withOpacity(0.1),
+                      spreadRadius: 1,
+                      blurRadius: 5,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
+                alignment: Alignment.center,
+                child: const Text(
+                  "No location logs match the selected date and time filters.",
+                  style: TextStyle(color: Colors.grey),
                   textAlign: TextAlign.center,
                 ),
               )
             : Column(
-                children: _locationLogs.map((log) {
+                children: sortedDates.map((dateKey) {
+                  final isExpanded = _expandedDateSections.contains(dateKey);
+                  final logsForDate = logsByDate[dateKey] ?? [];
+
                   return Padding(
-                    padding: const EdgeInsets.only(bottom: 8.0),
-                    child: _buildLocationLogCard(log),
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.grey.withOpacity(0.1),
+                            spreadRadius: 1,
+                            blurRadius: 5,
+                            offset: const Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        children: [
+                          // Date header (clickable)
+                          GestureDetector(
+                            onTap: () {
+                              setState(() {
+                                if (_expandedDateSections.contains(dateKey)) {
+                                  _expandedDateSections.remove(dateKey);
+                                } else {
+                                  _expandedDateSections.add(dateKey);
+                                }
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 14,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.shade50,
+                                borderRadius: isExpanded
+                                    ? const BorderRadius.only(
+                                        topLeft: Radius.circular(12),
+                                        topRight: Radius.circular(12),
+                                      )
+                                    : BorderRadius.circular(12),
+                              ),
+                              child: Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    '$dateKey (${logsForDate.length} logs)',
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.blue.shade800,
+                                    ),
+                                  ),
+                                  Icon(
+                                    isExpanded
+                                        ? Icons.expand_less
+                                        : Icons.expand_more,
+                                    color: Colors.blue.shade800,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          // Location logs for this date (shown when expanded)
+                          if (isExpanded)
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                border: Border(
+                                  top: BorderSide(
+                                    color: Colors.grey.shade200,
+                                    width: 1,
+                                  ),
+                                ),
+                              ),
+                              child: Column(
+                                children: logsForDate
+                                    .map(
+                                      (log) => Padding(
+                                        padding: const EdgeInsets.only(
+                                          bottom: 8,
+                                        ),
+                                        child: _buildLocationLogCard(log),
+                                      ),
+                                    )
+                                    .toList(),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   );
                 }).toList(),
               ),
@@ -791,54 +1199,31 @@ class _LocationHistoryScreenState extends State<LocationHistoryScreen>
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.location_on, color: Colors.red, size: 24),
-              const SizedBox(width: 12),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    "${log['latitude'].toStringAsFixed(6)}, ${log['longitude'].toStringAsFixed(6)}",
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w500,
-                      color: Colors.black87,
-                    ),
-                  ),
-                  Text(
-                    "$time ${log['childName']}",
-                    style: TextStyle(color: Colors.grey[600], fontSize: 13),
-                  ),
-                ],
-              ),
-            ],
-          ),
-          TextButton(
-            onPressed: () {
-              // Navigate to the RouteMapScreen to show the route for the selected day and child
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => RouteMapScreen(
-                    userId: _currentUser!.uid,
-                    childId: _selectedChildId!,
-                    childName: _children.firstWhere(
-                      (c) => c['id'] == _selectedChildId,
-                    )['name'],
-                    selectedDate: _selectedDate,
+          Expanded(
+            child: Row(
+              children: [
+                const Icon(Icons.location_on, color: Colors.red, size: 24),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "${log['latitude'].toStringAsFixed(6)}, ${log['longitude'].toStringAsFixed(6)}",
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                          color: Colors.black87,
+                        ),
+                      ),
+                      Text(
+                        "$time ${log['childName']}",
+                        style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                      ),
+                    ],
                   ),
                 ),
-              );
-            },
-            style: TextButton.styleFrom(
-              padding: EdgeInsets.zero,
-              alignment: Alignment.centerRight,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            child: const Text(
-              "View Route",
-              style: TextStyle(color: Colors.blue, fontSize: 14),
+              ],
             ),
           ),
         ],
