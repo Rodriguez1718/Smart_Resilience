@@ -21,6 +21,9 @@ class MainNavigation extends StatefulWidget {
 class _MainNavigationState extends State<MainNavigation> {
   int _selectedIndex = 0;
 
+  // NEW: Reference to HomeScreenState to mark alerts as viewed
+  late GlobalKey<State<HomeScreen>> _homeScreenKey;
+
   // IMPORTANT: The _screens list needs to be built inside the build method
   // or initialized in initState if it depends on `this` (the state object).
   // Otherwise, the `onTabSelected` callback won't correctly reference `setSelectedIndex`.
@@ -29,10 +32,29 @@ class _MainNavigationState extends State<MainNavigation> {
   @override
   void initState() {
     super.initState();
+    _homeScreenKey = GlobalKey<State<HomeScreen>>();
     // Initialize _screens here to use `this.setSelectedIndex`
     _screens = [
-      HomeScreen(onTabSelected: (index) => setSelectedIndex(index)),
-      const AlertScreen(),
+      HomeScreen(
+        key: _homeScreenKey,
+        onTabSelected: (index) => setSelectedIndex(index),
+      ),
+      AlertScreen(
+        onAlertViewed: (deviceId, timestamp) {
+          // NEW: Mark alert as viewed in home screen
+          if (_homeScreenKey.currentState != null) {
+            // Use the context to find the HomeScreen and call its method
+            try {
+              (_homeScreenKey.currentState as dynamic)?.markAlertAsViewed(
+                deviceId,
+                timestamp,
+              );
+            } catch (e) {
+              print('Error marking alert as viewed: $e');
+            }
+          }
+        },
+      ),
       const LocationHistoryScreen(), // Corrected screen name
       const SettingsScreen(),
     ];

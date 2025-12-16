@@ -39,6 +39,7 @@ dependencies:
     firebase_core: ^4.2.0
     firebase_auth: ^6.1.1
     cloud_firestore: ^6.0.3
+    firebase_app_check: ^0.4.1+2
 
     # Your other dependencies
     firebase_messaging: ^16.0.3
@@ -50,6 +51,12 @@ dependencies:
     firebase_storage: ^13.0.3
     image_picker: ^1.1.2
     path_provider: ^2.1.2
+    firebase_database: ^12.1.0
+    url_launcher: ^6.1.10
+    csv: ^6.0.0
+    pdf: ^3.10.0
+    printing: ^5.11.0
+    shared_preferences: ^2.2.0
 
 dev_dependencies:
     flutter_test:
@@ -64,7 +71,7 @@ dev_dependencies:
 
     # Add flutter_launcher_icons as a dev dependency so you can generate
     # platform icons from a single source image.
-    flutter_launcher_icons: ^0.10.0
+    flutter_launcher_icons: ^0.14.4
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

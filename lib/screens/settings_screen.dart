@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:smart_resilience_app/services/notification_service.dart'; // Import your NotificationService
 import 'package:firebase_auth/firebase_auth.dart'; // Import Firebase Auth
 import 'package:cloud_firestore/cloud_firestore.dart'; // Import Cloud Firestore
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:smart_resilience_app/screens/profile_page.dart'; // Import ProfilePage
 import 'package:smart_resilience_app/widgets/profile_avatar.dart';
 import 'dart:async'; // Import for StreamSubscription
@@ -24,17 +25,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _soundAlertEnabled = true;
   bool _vibrateOnlyEnabled = true;
   bool _bothSoundVibrationEnabled = true;
+  bool _smsEnabled = true; // NEW: SMS toggle state
 
   User? _currentUser;
+  String? _guardianDocId; // Store the guardian document ID
   String? _currentUserName; // To store the user's full name for the AppBar
   String? _currentUserPhotoUrl; // To store the user's profile photo URL
   StreamSubscription<User?>?
   _authStateSubscription; // Declare nullable subscription
   StreamSubscription<DocumentSnapshot>? _profileDocSubscription;
+  // NEW: Notification settings listener
+  StreamSubscription<DocumentSnapshot>? _notificationSettingsSub;
 
   @override
   void initState() {
     super.initState();
+    _loadGuardianDocId();
     _authStateSubscription = FirebaseAuth.instance.authStateChanges().listen((
       user,
     ) async {
@@ -49,95 +55,158 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _profileDocSubscription?.cancel();
 
       if (user != null) {
-        // Listen to guardian document so profile changes propagate to all screens
-        _profileDocSubscription = FirebaseFirestore.instance
-            .collection('guardians')
-            .doc(user.uid)
-            .snapshots()
-            .listen((snapshot) {
-              if (!mounted) return;
-              if (snapshot.exists && snapshot.data() != null) {
-                final data = snapshot.data() as Map<String, dynamic>;
-                setState(() {
-                  _currentUserName =
-                      data['fullName'] ?? user.phoneNumber ?? 'Guardian';
-                  _currentUserPhotoUrl = data['photoUrl'] as String?;
-                });
-              }
-            });
+        // Load guardian doc ID from local storage
+        final prefs = await SharedPreferences.getInstance();
+        final guardianDocId = prefs.getString('guardianDocId');
 
-        // Potentially load notification settings here if they depend on user ID
-        _loadNotificationSettings();
+        if (guardianDocId != null && guardianDocId.isNotEmpty) {
+          setState(() {
+            _guardianDocId = guardianDocId;
+          });
+
+          // Listen to guardian document so profile changes propagate to all screens
+          _profileDocSubscription = FirebaseFirestore.instance
+              .collection('guardians')
+              .doc(guardianDocId)
+              .snapshots()
+              .listen((snapshot) {
+                if (!mounted) return;
+                if (snapshot.exists && snapshot.data() != null) {
+                  final data = snapshot.data() as Map<String, dynamic>;
+                  setState(() {
+                    _currentUserName =
+                        data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+                    _currentUserPhotoUrl = data['photoUrl'] as String?;
+                    _smsEnabled =
+                        data['smsEnabled'] ?? true; // NEW: Load SMS state
+                  });
+                }
+              });
+
+          // Initialize notification settings if they don't exist
+          _initializeNotificationSettings(guardianDocId);
+          // Load notification settings
+          _loadNotificationSettings();
+        }
       } else {
         // User logged out, clear data
         setState(() {
           _currentUserName = null;
           _currentUserPhotoUrl = null;
+          _guardianDocId = null;
           // Reset settings to default if user logs out
           _soundAlertEnabled = true;
           _vibrateOnlyEnabled = true;
           _bothSoundVibrationEnabled = true;
+          _smsEnabled = true; // NEW: Reset SMS state on logout
         });
       }
     });
+  }
+
+  Future<void> _loadGuardianDocId() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final docId = prefs.getString('guardianDocId');
+      if (docId != null && docId.isNotEmpty) {
+        setState(() {
+          _guardianDocId = docId;
+        });
+        print('✅ SettingsScreen: Loaded guardian doc ID: $docId');
+      }
+    } catch (e) {
+      print('❌ SettingsScreen: Error loading guardian doc ID: $e');
+    }
   }
 
   @override
   void dispose() {
     _authStateSubscription?.cancel(); // Cancel the subscription
     _profileDocSubscription?.cancel(); // Cancel profile doc listener
+    _notificationSettingsSub
+        ?.cancel(); // NEW: Cancel notification settings listener
     super.dispose();
   }
 
+  // NEW: Initialize notification settings document if it doesn't exist
+  Future<void> _initializeNotificationSettings(String userId) async {
+    try {
+      final settingsRef = FirebaseFirestore.instance
+          .collection('guardians')
+          .doc(userId)
+          .collection('settings')
+          .doc('notifications');
+
+      // Check if the document exists
+      final docSnapshot = await settingsRef.get();
+
+      if (!docSnapshot.exists) {
+        // Document doesn't exist, create it with default values
+        await settingsRef.set({
+          'soundAlertEnabled': true,
+          'vibrateOnlyEnabled': true,
+          'bothSoundVibrationEnabled': true,
+          'lastUpdated': FieldValue.serverTimestamp(),
+          'isPlaceholder': false,
+        });
+        print("Notification settings initialized for user: $userId");
+      }
+    } catch (e) {
+      print("Error initializing notification settings: $e");
+    }
+  }
+
   Future<void> _loadNotificationSettings() async {
-    if (_currentUser == null) {
-      print("Cannot load notification settings: User ID is null.");
+    if (_guardianDocId == null) {
+      print("Cannot load notification settings: Guardian doc ID is null.");
       return;
     }
 
     try {
-      DocumentSnapshot settingsDoc = await FirebaseFirestore.instance
-          .collection('guardians')
-          .doc(_currentUser!.uid)
-          .collection('settings')
-          .doc(
-            'notifications',
-          ) // Assuming 'notifications' is the specific doc for settings
-          .get();
+      // Cancel existing subscription if any
+      await _notificationSettingsSub?.cancel();
 
-      if (settingsDoc.exists && settingsDoc.data() != null) {
-        final data = settingsDoc.data() as Map<String, dynamic>;
-        // Check for the placeholder and actual data
-        if (data['isPlaceholder'] == true) {
-          setState(() {
-            _soundAlertEnabled =
-                true; // Default to true if only placeholder exists
-            _vibrateOnlyEnabled = true;
-            _bothSoundVibrationEnabled = true;
-          });
-          // Optionally, save the default setting to replace the placeholder
-          await _saveNotificationSettings(
-            sound: true,
-            vibrate: true,
-            both: true,
-          ); // Save initial defaults
-        } else {
-          setState(() {
-            _soundAlertEnabled = data['soundAlertEnabled'] ?? true;
-            _vibrateOnlyEnabled = data['vibrateOnlyEnabled'] ?? true;
-            _bothSoundVibrationEnabled =
-                data['bothSoundVibrationEnabled'] ?? true;
-          });
-        }
-      } else {
-        // If settings doc doesn't exist at all, assume default true and save it
-        setState(() {
-          _soundAlertEnabled = true;
-          _vibrateOnlyEnabled = true;
-          _bothSoundVibrationEnabled = true;
-        });
-        await _saveNotificationSettings(sound: true, vibrate: true, both: true);
-      }
+      // Listen to the notification settings document in real-time
+      _notificationSettingsSub = FirebaseFirestore.instance
+          .collection('guardians')
+          .doc(_guardianDocId!)
+          .collection('settings')
+          .doc('notifications')
+          .snapshots()
+          .listen(
+            (settingsDoc) {
+              if (!mounted) return;
+
+              if (settingsDoc.exists && settingsDoc.data() != null) {
+                final data = settingsDoc.data() as Map<String, dynamic>;
+                // Check for the placeholder and actual data
+                if (data['isPlaceholder'] == true) {
+                  setState(() {
+                    _soundAlertEnabled = true;
+                    _vibrateOnlyEnabled = true;
+                    _bothSoundVibrationEnabled = true;
+                  });
+                } else {
+                  setState(() {
+                    _soundAlertEnabled = data['soundAlertEnabled'] ?? true;
+                    _vibrateOnlyEnabled = data['vibrateOnlyEnabled'] ?? true;
+                    _bothSoundVibrationEnabled =
+                        data['bothSoundVibrationEnabled'] ?? true;
+                  });
+                }
+              } else {
+                // If settings doc doesn't exist at all, assume default true
+                setState(() {
+                  _soundAlertEnabled = true;
+                  _vibrateOnlyEnabled = true;
+                  _bothSoundVibrationEnabled = true;
+                });
+              }
+            },
+            onError: (e) {
+              print("Error listening to notification settings: $e");
+            },
+          );
     } catch (e) {
       print("Error loading notification settings: $e");
     }
@@ -191,13 +260,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         const SizedBox(height: 8),
         _buildBothSoundVibrationToggle(),
         const SizedBox(height: 24),
-        _buildLocationSettingsSection(),
-        const SizedBox(height: 16),
-        _buildGeofenceSettingsSection(),
-        const SizedBox(height: 16),
-        _buildPrivacySettingsSection(),
-        const SizedBox(height: 16),
-        _buildAppSettingsSection(),
+        _buildSMSAlertToggle(), // NEW: SMS toggle section
         const SizedBox(height: 24),
         _buildPreviewAlertFeedbackButton(),
         const SizedBox(height: 16),
@@ -301,17 +364,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
             radius: 18,
             onProfileUpdated: (updated) async {
               if (updated == true) {
-                final user = FirebaseAuth.instance.currentUser;
-                if (user != null) {
+                if (_guardianDocId != null) {
                   final doc = await FirebaseFirestore.instance
                       .collection('guardians')
-                      .doc(user.uid)
+                      .doc(_guardianDocId)
                       .get();
                   if (doc.exists && doc.data() != null) {
                     final data = doc.data() as Map<String, dynamic>;
                     setState(() {
                       _currentUserName =
-                          data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+                          data['fullName'] ??
+                          _currentUser?.phoneNumber ??
+                          'Guardian';
                       _currentUserPhotoUrl = data['photoUrl'] as String?;
                     });
                   }
@@ -440,6 +504,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  // NEW: SMS Alert Toggle
+  Widget _buildSMSAlertToggle() {
+    return _buildSettingToggleCard(
+      title: "SMS Alerts",
+      description: "Send text messages for critical alerts",
+      value: _smsEnabled,
+      onChanged: (bool value) {
+        setState(() {
+          _smsEnabled = value;
+        });
+        print("SMS Alerts: $value");
+        // Save SMS setting to guardians root document
+        if (_currentUser != null) {
+          FirebaseFirestore.instance
+              .collection('guardians')
+              .doc(_currentUser!.uid)
+              .update({'smsEnabled': value})
+              .catchError((error) {
+                print("Error updating SMS setting: $error");
+              });
+        }
+      },
+    );
+  }
+
   Widget _buildPreviewAlertFeedbackButton() {
     return SizedBox(
       width: double.infinity, // Make it take full width
@@ -480,194 +569,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
         ),
       ),
-    );
-  }
-
-  Widget _buildLocationSettingsSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          "Location Settings",
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "High Accuracy Location",
-          description: "Use GPS for precise location tracking",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement location accuracy setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Location accuracy: ${value ? "High" : "Standard"}',
-                ),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Background Location",
-          description: "Track location when app is in background",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement background location setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Background tracking: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildGeofenceSettingsSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          "Safe Zone Settings",
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Entry Notifications",
-          description: "Get notified when child enters a safe zone",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement geofence entry notifications
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Entry notifications: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Exit Notifications",
-          description: "Get notified when child leaves a safe zone",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement geofence exit notifications
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Exit notifications: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildPrivacySettingsSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          "Privacy & Security",
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Data Encryption",
-          description: "Encrypt location data for enhanced security",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement data encryption setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Data encryption: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Location History",
-          description: "Store location history for route tracking",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement location history setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Location history: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAppSettingsSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          "App Settings",
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Auto-Update Location",
-          description: "Automatically refresh location every 5 minutes",
-          value: true,
-          onChanged: (value) {
-            // TODO: Implement auto-update setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Auto-update: ${value ? "Enabled" : "Disabled"}'),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Battery Optimization",
-          description: "Optimize app for better battery life",
-          value: false,
-          onChanged: (value) {
-            // TODO: Implement battery optimization setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Battery optimization: ${value ? "Enabled" : "Disabled"}',
-                ),
-              ),
-            );
-          },
-        ),
-        const SizedBox(height: 8),
-        _buildSettingToggleCard(
-          title: "Dark Mode",
-          description: "Use dark theme for better visibility",
-          value: false,
-          onChanged: (value) {
-            // TODO: Implement dark mode setting
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Dark mode: ${value ? "Enabled" : "Disabled"}'),
-              ),
-            );
-          },
-        ),
-      ],
     );
   }
 }

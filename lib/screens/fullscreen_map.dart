@@ -49,10 +49,32 @@ class _FullscreenMapState extends State<FullscreenMap> {
     _currentZoneName = widget.initialZoneName;
     _zoneNameController = TextEditingController(text: _currentZoneName);
 
-    // Only try to determine current position if adding/editing a zone,
-    // and if the initial location is not already explicitly provided (e.g., from an existing zone)
-    if (widget.isForAddingOrEditing && widget.initialSafeZoneId == null) {
-      _determinePositionAndSetMapCenter();
+    // If parent passed child locations (device locations), prefer centering on the device
+    if (widget.allChildLocations != null &&
+        widget.allChildLocations!.isNotEmpty) {
+      try {
+        final first = widget.allChildLocations!.first;
+        if (first['location'] is LatLng) {
+          _currentLocation = first['location'] as LatLng;
+        }
+      } catch (e) {
+        // ignore and fall back to initialLocation
+      }
+
+      // Ensure the controller moves after first frame
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        try {
+          _mapController.move(_currentLocation, 16.0);
+        } catch (e) {
+          // swallow errors if controller isn't ready
+        }
+      });
+    } else {
+      // Only try to determine current position if adding/editing a zone,
+      // and if the initial location is not already explicitly provided (e.g., from an existing zone)
+      if (widget.isForAddingOrEditing && widget.initialSafeZoneId == null) {
+        _determinePositionAndSetMapCenter();
+      }
     }
   }
 
@@ -103,7 +125,12 @@ class _FullscreenMapState extends State<FullscreenMap> {
     );
     setState(() {
       _currentLocation = LatLng(position.latitude, position.longitude);
-      _mapController.move(_currentLocation, _mapController.camera.zoom);
+      // Use a sensible default zoom when centering from device GPS
+      try {
+        _mapController.move(_currentLocation, 16.0);
+      } catch (e) {
+        // ignore
+      }
     });
   }
 

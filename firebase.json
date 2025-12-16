@@ -1,1 +1,38 @@
-{"flutter":{"platforms":{"android":{"default":{"projectId":"smart-resilience","appId":"1:704068278126:android:9799c515c528ebd8ac537f","fileOutput":"android/app/google-services.json"}},"dart":{"lib/firebase_options.dart":{"projectId":"smart-resilience","configurations":{"android":"1:704068278126:android:9799c515c528ebd8ac537f","windows":"1:704068278126:web:ac588aab00622ac0ac537f"}}}}}}
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "smart-resilience",
+          "appId": "1:704068278126:android:9799c515c528ebd8ac537f",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "smart-resilience",
+          "configurations": {
+            "android": "1:704068278126:android:9799c515c528ebd8ac537f",
+            "windows": "1:704068278126:web:ac588aab00622ac0ac537f"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run lint"
+      ]
+    }
+  ]
+}

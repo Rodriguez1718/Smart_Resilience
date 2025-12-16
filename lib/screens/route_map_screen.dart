@@ -5,10 +5,10 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'dart:io';
 import 'dart:async';
+import 'dart:convert';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:smart_resilience_app/screens/profile_page.dart';
-import 'package:smart_resilience_app/widgets/profile_avatar.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:intl/intl.dart'; // For date formatting
 
 class RouteMapScreen extends StatefulWidget {
@@ -35,6 +35,7 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   String? _currentUserPhotoUrl;
   StreamSubscription<User?>? _authStateSubscription;
   StreamSubscription<DocumentSnapshot>? _profileDocSubscription;
+  StreamSubscription<DatabaseEvent>? _historySubscription;
   List<LatLng> _routePoints = [];
   bool _isLoadingRoute = true;
   LatLng _mapCenter = LatLng(10.6667, 122.95); // Default to Bacolod
@@ -50,121 +51,187 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       if (!mounted) return;
       _currentUser = user;
 
-      // cancel previous profile listener
+      // cancel previous subscriptions
       await _profileDocSubscription?.cancel();
+      await _historySubscription?.cancel();
 
       if (user != null) {
+        // keep profile avatar/name in sync
         _profileDocSubscription = FirebaseFirestore.instance
             .collection('guardians')
             .doc(user.uid)
             .snapshots()
-            .listen((snapshot) {
+            .listen((doc) {
               if (!mounted) return;
-              if (snapshot.exists && snapshot.data() != null) {
-                final data = snapshot.data() as Map<String, dynamic>;
+              if (doc.exists && doc.data() != null) {
+                final data = doc.data() as Map<String, dynamic>;
                 setState(() {
                   _currentUserName =
-                      data['fullName'] ?? user.phoneNumber ?? 'Guardian';
+                      data['fullName'] ??
+                      _currentUser!.phoneNumber ??
+                      'Guardian';
                   _currentUserPhotoUrl = data['photoUrl'] as String?;
                 });
               }
             });
-      } else {
-        setState(() {
-          _currentUserName = null;
-          _currentUserPhotoUrl = null;
-        });
+
+        setState(() => _isLoadingRoute = true);
+
+        try {
+          final db = FirebaseDatabase.instance;
+          final ref = db.ref('history/${widget.childId}');
+
+          // Cancel previous subscription if any
+          await _historySubscription?.cancel();
+
+          _historySubscription = ref.onValue.listen((DatabaseEvent event) {
+            if (!mounted) return;
+
+            final snapshot = event.snapshot;
+            final value = snapshot.value;
+
+            List<Map<String, dynamic>> entries = [];
+
+            if (value != null) {
+              if (value is Map) {
+                value.forEach((key, v) {
+                  Map<String, dynamic>? entry;
+                  if (v is Map)
+                    entry = Map<String, dynamic>.from(v);
+                  else if (v is String) {
+                    try {
+                      final decoded = jsonDecode(v);
+                      if (decoded is Map)
+                        entry = Map<String, dynamic>.from(decoded);
+                    } catch (_) {}
+                  }
+                  if (entry != null) {
+                    entry['__key'] = key;
+                    entries.add(entry);
+                  }
+                });
+              } else if (value is List) {
+                for (var v in value) {
+                  if (v is Map)
+                    entries.add(Map<String, dynamic>.from(v));
+                  else if (v is String) {
+                    try {
+                      final decoded = jsonDecode(v);
+                      if (decoded is Map)
+                        entries.add(Map<String, dynamic>.from(decoded));
+                    } catch (_) {}
+                  }
+                }
+              }
+            }
+
+            // Normalize & filter by date, allow lat/lng or lat/lon
+            List<Map<String, dynamic>> datedPoints = [];
+            for (var e in entries) {
+              final tsRaw = e['timestamp'];
+              int ts = 0;
+              if (tsRaw is int)
+                ts = tsRaw;
+              else if (tsRaw is String)
+                ts = int.tryParse(tsRaw) ?? 0;
+              if (ts > 0 && ts < 10000000000) ts = ts * 1000;
+              if (ts <= 0) continue;
+
+              final dt = DateTime.fromMillisecondsSinceEpoch(ts);
+              if (dt.year == widget.selectedDate.year &&
+                  dt.month == widget.selectedDate.month &&
+                  dt.day == widget.selectedDate.day) {
+                double lat = 0.0;
+                double lng = 0.0;
+                // possible key variants
+                final latKeys = ['lat', 'latitude', 'Lat', 'LAT'];
+                final lngKeys = ['lng', 'lon', 'longitude', 'Lon', 'LON'];
+                for (var k in latKeys) {
+                  if (e.containsKey(k)) {
+                    lat = double.tryParse(e[k]?.toString() ?? '') ?? lat;
+                    break;
+                  }
+                }
+                for (var k in lngKeys) {
+                  if (e.containsKey(k)) {
+                    lng = double.tryParse(e[k]?.toString() ?? '') ?? lng;
+                    break;
+                  }
+                }
+
+                if (lat != 0.0 || lng != 0.0) {
+                  datedPoints.add({'ts': ts, 'lat': lat, 'lng': lng});
+                }
+              }
+            }
+
+            // Sort & convert
+            datedPoints.sort(
+              (a, b) => (a['ts'] as int).compareTo(b['ts'] as int),
+            );
+            final points = datedPoints
+                .map((p) => LatLng((p['lat'] as double), (p['lng'] as double)))
+                .toList();
+
+            // compute center/zoom similar to previous logic
+            LatLng mapCenter = _mapCenter;
+            double mapZoom = _mapZoom;
+            if (points.isNotEmpty) {
+              mapCenter = points.first;
+              double minLat = points
+                  .map((p) => p.latitude)
+                  .reduce((a, b) => a < b ? a : b);
+              double maxLat = points
+                  .map((p) => p.latitude)
+                  .reduce((a, b) => a > b ? a : b);
+              double minLng = points
+                  .map((p) => p.longitude)
+                  .reduce((a, b) => a < b ? a : b);
+              double maxLng = points
+                  .map((p) => p.longitude)
+                  .reduce((a, b) => a > b ? a : b);
+              LatLngBounds bounds = LatLngBounds(
+                LatLng(minLat, minLng),
+                LatLng(maxLat, maxLng),
+              );
+              double latDiff = bounds.north - bounds.south;
+              double lngDiff = bounds.east - bounds.west;
+              if (latDiff == 0 && lngDiff == 0) {
+                mapZoom = 16.0;
+              } else {
+                mapZoom = 14.0 - (latDiff.abs() * 50 + lngDiff.abs() * 50);
+                if (mapZoom < 12) mapZoom = 12;
+                if (mapZoom > 17) mapZoom = 17;
+                mapCenter = bounds.center;
+              }
+            }
+
+            setState(() {
+              _routePoints = points;
+              _mapCenter = mapCenter;
+              _mapZoom = mapZoom;
+              _isLoadingRoute = false;
+            });
+          });
+        } catch (e) {
+          print("Error loading route points from RTDB: $e");
+          if (mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text("Error loading route: $e")));
+          }
+          setState(() => _isLoadingRoute = false);
+        }
       }
     });
-
-    _loadRoutePoints();
   }
 
   @override
   void dispose() {
     _authStateSubscription?.cancel();
     _profileDocSubscription?.cancel();
+    _historySubscription?.cancel();
     super.dispose();
-  }
-
-  Future<void> _loadRoutePoints() async {
-    setState(() {
-      _isLoadingRoute = true;
-    });
-
-    try {
-      // --- MOCK DATA FOR DEMONSTRATION ---
-      // These points simulate a route around Bacolod City.
-      // In a real application, these would be fetched from Firestore.
-      List<LatLng> mockPoints = [
-        LatLng(10.6667, 122.95), // Starting point (e.g., near city center)
-        LatLng(10.6680, 122.9510), // Move slightly North-East
-        LatLng(10.6695, 122.9530), // Further North-East
-        LatLng(10.6670, 122.9550), // Move South-East
-        LatLng(10.6650, 122.9545), // South
-        LatLng(10.6640, 122.9520), // South-West
-        LatLng(10.6655, 122.9490), // Back towards starting area
-      ];
-
-      // Add more points if you want a longer, more complex mock route
-      // For example, if you want to show movement over a full day, you'd have many more points.
-      // For a single day's history, we'll use these few to demonstrate the polyline.
-
-      if (mockPoints.isNotEmpty) {
-        _mapCenter = mockPoints.first; // Center on the start of the mock route
-        // Adjust zoom to fit all mock points
-        double minLat = mockPoints
-            .map((p) => p.latitude)
-            .reduce((a, b) => a < b ? a : b);
-        double maxLat = mockPoints
-            .map((p) => p.latitude)
-            .reduce((a, b) => a > b ? a : b);
-        double minLng = mockPoints
-            .map((p) => p.longitude)
-            .reduce((a, b) => a < b ? a : b);
-        double maxLng = mockPoints
-            .map((p) => p.longitude)
-            .reduce((a, b) => a > b ? a : b);
-
-        // Calculate bounds and center for the mock data
-        LatLngBounds bounds = LatLngBounds(
-          LatLng(minLat, minLng),
-          LatLng(maxLat, maxLng),
-        );
-
-        // A simple way to estimate zoom for bounds (FlutterMap's MapController.fitBounds is better for real-time)
-        double latDiff = bounds.north - bounds.south;
-        double lngDiff = bounds.east - bounds.west;
-
-        if (latDiff == 0 && lngDiff == 0) {
-          _mapZoom = 16.0; // Stay zoomed in on a single point
-        } else {
-          // Approximate zoom level based on the span of coordinates
-          // These values are empirical and might need fine-tuning
-          _mapZoom = 14.0 - (latDiff.abs() * 50 + lngDiff.abs() * 50);
-          if (_mapZoom < 12)
-            _mapZoom = 12; // Minimum reasonable zoom for a route
-          if (_mapZoom > 17) _mapZoom = 17; // Maximum zoom
-          _mapCenter = bounds.center;
-        }
-      }
-
-      setState(() {
-        _routePoints = mockPoints;
-      });
-      // --- END MOCK DATA ---
-    } catch (e) {
-      print("Error loading route points (mock data simulation): $e");
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Error loading route: $e")));
-      }
-    } finally {
-      setState(() {
-        _isLoadingRoute = false;
-      });
-    }
   }
 
   @override
@@ -243,39 +310,9 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          '${widget.childName}\'s Route on ${DateFormat('MMM d, yyyy').format(widget.selectedDate)}',
-        ),
+        title: Text('${widget.childName}\'s Route'),
         backgroundColor: Colors.white,
         elevation: 0,
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16.0),
-            child: ProfileAvatar(
-              photoPath: _currentUserPhotoUrl,
-              displayName: _currentUserName,
-              radius: 18,
-              onProfileUpdated: (updated) async {
-                if (updated == true && _currentUser != null) {
-                  final doc = await FirebaseFirestore.instance
-                      .collection('guardians')
-                      .doc(_currentUser!.uid)
-                      .get();
-                  if (doc.exists && doc.data() != null) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    setState(() {
-                      _currentUserName =
-                          data['fullName'] ??
-                          _currentUser!.phoneNumber ??
-                          'Guardian';
-                      _currentUserPhotoUrl = data['photoUrl'] as String?;
-                    });
-                  }
-                }
-              },
-            ),
-          ),
-        ],
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -289,7 +326,27 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
             ],
           ),
         ),
-        child: bodyContent,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    DateFormat('MMMM d, yyyy').format(widget.selectedDate),
+                    style: const TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(child: bodyContent),
+          ],
+        ),
       ),
     );
   }

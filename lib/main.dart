@@ -2,18 +2,25 @@
 
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_auth/firebase_auth.dart'; // Still needed for splash_screen to check auth
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'firebase_options.dart';
 import 'screens/splash_screen.dart'; // Your splash screen
 import 'screens/main_navigation.dart'; // Your main app screen (home page)
 import 'package:smart_resilience_app/services/notification_service.dart'; // Your notification service
+import 'package:smart_resilience_app/services/messaging_service.dart'; // NEW: FCM service
 import 'screens/guardian_login_page.dart'; // Your guardian login page
 import 'screens/guardian_setup_screen.dart'; // Your guardian setup screen
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  // Initialize Firebase App Check for development
+  await FirebaseAppCheck.instance.activate();
+
   await NotificationService.initializeNotifications();
+  // NEW: Initialize Firebase Messaging (handles background notifications)
+  await MessagingService.initializeMessaging();
   runApp(const MyApp());
 }
 
