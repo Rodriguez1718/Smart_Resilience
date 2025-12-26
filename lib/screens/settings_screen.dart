@@ -263,6 +263,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _buildSMSAlertToggle(), // NEW: SMS toggle section
         const SizedBox(height: 24),
         _buildPreviewAlertFeedbackButton(),
+        const SizedBox(height: 24),
+        _buildAppFeedbackButton(), // NEW: Feedback button
         const SizedBox(height: 16),
       ],
     );
@@ -570,5 +572,178 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
+  }
+
+  // NEW: App Feedback Button
+  Widget _buildAppFeedbackButton() {
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: _showFeedbackDialog,
+        icon: const Icon(Icons.feedback),
+        label: const Text(
+          "Send Feedback",
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.orange,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          elevation: 3,
+        ),
+      ),
+    );
+  }
+
+  // NEW: Show feedback dialog
+  void _showFeedbackDialog() {
+    final feedbackController = TextEditingController();
+    String selectedCategory = 'General';
+    final categories = ['General', 'Bug Report', 'Feature Request', 'Other'];
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Send Feedback'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Help us improve Smart Resilience',
+                  style: TextStyle(color: Colors.grey, fontSize: 12),
+                ),
+                const SizedBox(height: 16),
+                // Category Dropdown
+                const Text(
+                  'Category',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 8),
+                DropdownButton<String>(
+                  value: selectedCategory,
+                  isExpanded: true,
+                  items: categories.map((String category) {
+                    return DropdownMenuItem<String>(
+                      value: category,
+                      child: Text(category),
+                    );
+                  }).toList(),
+                  onChanged: (String? value) {
+                    if (value != null) {
+                      setState(() {
+                        selectedCategory = value;
+                      });
+                    }
+                  },
+                ),
+                const SizedBox(height: 16),
+                // Feedback Text Field
+                const Text(
+                  'Your Feedback',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: feedbackController,
+                  maxLines: 5,
+                  decoration: InputDecoration(
+                    hintText: 'Please share your thoughts...',
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                if (feedbackController.text.trim().isNotEmpty) {
+                  _submitFeedback(feedbackController.text, selectedCategory);
+                  Navigator.of(context).pop();
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Please enter your feedback')),
+                  );
+                }
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+              child: const Text('Submit'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // NEW: Submit feedback to Firestore
+  Future<void> _submitFeedback(String feedbackText, String category) async {
+    if (_guardianDocId == null) {
+      print("❌ Cannot submit feedback: Guardian doc ID is not available");
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Error: User information not available')),
+      );
+      return;
+    }
+
+    try {
+      final feedbackData = {
+        'userId': _guardianDocId,
+        'userPhone': _currentUser?.phoneNumber ?? 'Unknown',
+        'userName': _currentUserName ?? 'Guardian',
+        'category': category,
+        'feedbackText': feedbackText,
+        'timestamp': FieldValue.serverTimestamp(),
+        'status': 'unread', // For admin to mark as read
+      };
+
+      print('📝 Submitting feedback data: $feedbackData');
+
+      // Store feedback in both locations for redundancy and admin access
+      // 1. In user's subcollection (for user reference)
+      print('📝 Writing to guardians/$_guardianDocId/feedback/...');
+      await FirebaseFirestore.instance
+          .collection('guardians')
+          .doc(_guardianDocId!)
+          .collection('feedback')
+          .add(feedbackData);
+      print('✅ Successfully wrote to guardians collection');
+
+      // 2. In top-level admin_feedback collection (for easy admin access)
+      print('📝 Writing to admin_feedback/...');
+      await FirebaseFirestore.instance
+          .collection('admin_feedback')
+          .add(feedbackData);
+      print('✅ Successfully wrote to admin_feedback collection');
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Thank you! Your feedback has been submitted.'),
+          backgroundColor: Colors.green,
+        ),
+      );
+      print("✅ Feedback submitted successfully");
+    } catch (e, stackTrace) {
+      print("❌ Error submitting feedback: $e");
+      print("❌ Stack trace: $stackTrace");
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error submitting feedback: $e')));
+    }
   }
 }

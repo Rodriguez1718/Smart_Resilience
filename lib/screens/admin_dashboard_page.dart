@@ -156,6 +156,43 @@ class PanicAlert {
   });
 }
 
+// NEW: Model for user feedback
+class FeedbackItem {
+  final String id;
+  final String userId;
+  final String userName;
+  final String userPhone;
+  final String category;
+  final String feedbackText;
+  final DateTime timestamp;
+  final String status;
+
+  FeedbackItem({
+    required this.id,
+    required this.userId,
+    required this.userName,
+    required this.userPhone,
+    required this.category,
+    required this.feedbackText,
+    required this.timestamp,
+    required this.status,
+  });
+
+  factory FeedbackItem.fromFirestore(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>;
+    return FeedbackItem(
+      id: doc.id,
+      userId: data['userId'] ?? '',
+      userName: data['userName'] ?? 'Anonymous',
+      userPhone: data['userPhone'] ?? 'Unknown',
+      category: data['category'] ?? 'General',
+      feedbackText: data['feedbackText'] ?? '',
+      timestamp: (data['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      status: data['status'] ?? 'unread',
+    );
+  }
+}
+
 class AdminDashboardPage extends StatefulWidget {
   const AdminDashboardPage({super.key});
 
@@ -174,12 +211,15 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
   StreamSubscription<DatabaseEvent>? _alertsSubscription;
   bool _showMap = false;
   bool _showReports = false; // NEW: Track if reports view is shown
+  bool _showFeedback = false; // NEW: Track if feedback view is shown
   String _selectedPeriod =
       'Week'; // NEW: Selected period for reports (Week, Month, Year)
+  late DateTime _selectedReportDate; // NEW: Selected date for report filtering
 
   @override
   void initState() {
     super.initState();
+    _selectedReportDate = DateTime.now(); // Initialize to today
     _preloadChildNames(); // Load child names first
     _loadAlertsFromFirebase();
   }
@@ -491,52 +531,97 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
               ),
             ],
           ),
-          actions: [
-            if (_showReports)
-              Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: IconButton(
-                  icon: const Icon(Icons.arrow_back, color: Colors.black),
-                  onPressed: () {
-                    setState(() {
-                      _showReports = false;
-                    });
-                  },
-                ),
+        ),
+        body: Column(
+          children: [
+            // Control buttons below header
+            Container(
+              color: Colors.white,
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16.0,
+                vertical: 12.0,
               ),
-            Padding(
-              padding: const EdgeInsets.only(right: 16.0),
-              child: ElevatedButton(
-                onPressed: _showReports
-                    ? _showExportOptions
-                    : () {
+              child: Row(
+                children: [
+                  if (_showReports)
+                    IconButton(
+                      icon: const Icon(Icons.arrow_back, color: Colors.black),
+                      onPressed: () {
                         setState(() {
-                          _showReports = true;
+                          _showReports = false;
                         });
                       },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16.0),
+                    ),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _showReports
+                          ? _showExportOptions
+                          : () {
+                              setState(() {
+                                _showReports = true;
+                              });
+                            },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16.0),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 12,
+                        ),
+                      ),
+                      child: Text(
+                        _showReports ? 'Export Report' : 'View Reports',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
                   ),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 12,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () {
+                        setState(() {
+                          _showFeedback = !_showFeedback;
+                          if (_showFeedback) {
+                            _showMap = false;
+                            _showReports = false;
+                          }
+                        });
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _showFeedback
+                            ? Colors.orange
+                            : Colors.blue,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16.0),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 12,
+                        ),
+                      ),
+                      child: Text(
+                        _showFeedback ? 'Back to Dashboard' : 'View Feedback',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
                   ),
-                ),
-                child: Text(
-                  _showReports ? 'Export Report' : 'View Reports',
-                  style: const TextStyle(color: Colors.white),
-                ),
+                ],
               ),
+            ),
+            // Main content
+            Expanded(
+              child: _showMap
+                  ? _buildMapView()
+                  : _showReports
+                  ? _buildReportsView()
+                  : _showFeedback
+                  ? _buildFeedbackView()
+                  : _buildDashboardView(),
             ),
           ],
         ),
-        body: _showMap
-            ? _buildMapView()
-            : _showReports
-            ? _buildReportsView()
-            : _buildDashboardView(),
       ),
     );
   }
@@ -942,6 +1027,532 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     );
   }
 
+  // NEW: Build feedback view
+  Widget _buildFeedbackView() {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance
+          .collection('admin_feedback')
+          .orderBy('timestamp', descending: true)
+          .snapshots(),
+      builder: (context, snapshot) {
+        print('=== Feedback StreamBuilder State ===');
+        print('ConnectionState: ${snapshot.connectionState}');
+        print('HasData: ${snapshot.hasData}');
+        print('HasError: ${snapshot.hasError}');
+        if (snapshot.hasError) {
+          print('Error: ${snapshot.error}');
+          print('StackTrace: ${snapshot.stackTrace}');
+        }
+        if (snapshot.hasData) {
+          print('Documents count: ${snapshot.data!.docs.length}');
+          for (var doc in snapshot.data!.docs) {
+            print('Doc: ${doc.id}, Data: ${doc.data()}');
+          }
+        }
+
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snapshot.hasError) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.error_outline, size: 64, color: Colors.red),
+                const SizedBox(height: 16),
+                Text(
+                  'Error loading feedback: ${snapshot.error}',
+                  style: const TextStyle(fontSize: 14, color: Colors.red),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          );
+        }
+
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.feedback_outlined, size: 64, color: Colors.grey),
+                const SizedBox(height: 16),
+                const Text(
+                  'No feedback received yet',
+                  style: TextStyle(fontSize: 18, color: Colors.grey),
+                ),
+              ],
+            ),
+          );
+        }
+
+        final feedbacks = snapshot.data!.docs
+            .map((doc) => FeedbackItem.fromFirestore(doc))
+            .toList();
+
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Header
+              const Text(
+                'User Feedback',
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${feedbacks.length} feedback(s) received',
+                style: const TextStyle(fontSize: 14, color: Colors.black54),
+              ),
+              const SizedBox(height: 24),
+              // Feedback Stats
+              Wrap(
+                spacing: 16.0,
+                runSpacing: 16.0,
+                children: [
+                  _buildFeedbackStatCard(
+                    'Total Feedback',
+                    feedbacks.length.toString(),
+                    Icons.message,
+                    Colors.blue,
+                  ),
+                  _buildFeedbackStatCard(
+                    'Unread',
+                    feedbacks
+                        .where((f) => f.status == 'unread')
+                        .length
+                        .toString(),
+                    Icons.mail,
+                    Colors.orange,
+                  ),
+                  _buildFeedbackStatCard(
+                    'Bug Reports',
+                    feedbacks
+                        .where((f) => f.category == 'Bug Report')
+                        .length
+                        .toString(),
+                    Icons.bug_report,
+                    Colors.red,
+                  ),
+                  _buildFeedbackStatCard(
+                    'Feature Requests',
+                    feedbacks
+                        .where((f) => f.category == 'Feature Request')
+                        .length
+                        .toString(),
+                    Icons.lightbulb,
+                    Colors.green,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              // Feedback List
+              const Text(
+                'All Feedback',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              ...feedbacks
+                  .map((feedback) => _buildFeedbackCard(feedback))
+                  .toList(),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // NEW: Build feedback stat card
+  Widget _buildFeedbackStatCard(
+    String title,
+    String value,
+    IconData icon,
+    Color color,
+  ) {
+    return Container(
+      width: 150,
+      padding: const EdgeInsets.all(16.0),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12.0),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.grey.withOpacity(0.1),
+            spreadRadius: 1,
+            blurRadius: 5,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: color, size: 28),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 4),
+          Text(title, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+        ],
+      ),
+    );
+  }
+
+  // NEW: Build feedback card
+  Widget _buildFeedbackCard(FeedbackItem feedback) {
+    final categoryColor = _getFeedbackCategoryColor(feedback.category);
+    final formattedDate = DateFormat(
+      'MMM d, yyyy • hh:mm a',
+    ).format(feedback.timestamp);
+
+    return GestureDetector(
+      onTap: () => _showFeedbackDetailDialog(feedback),
+      child: Card(
+        elevation: 2.0,
+        margin: const EdgeInsets.only(bottom: 12.0),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12.0),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header with user info and category
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          feedback.userName,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          feedback.userPhone,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Chip(
+                    label: Text(
+                      feedback.category,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    backgroundColor: categoryColor.withOpacity(0.2),
+                    labelStyle: TextStyle(color: categoryColor),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              // Feedback text preview
+              Container(
+                padding: const EdgeInsets.all(12.0),
+                decoration: BoxDecoration(
+                  color: Colors.grey[50],
+                  borderRadius: BorderRadius.circular(8.0),
+                  border: Border.all(color: Colors.grey[200]!),
+                ),
+                child: Text(
+                  feedback.feedbackText,
+                  style: const TextStyle(fontSize: 14, height: 1.5),
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Footer with timestamp and status
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    formattedDate,
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                  Row(
+                    children: [
+                      if (feedback.status == 'unread')
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.orange.shade100,
+                            borderRadius: BorderRadius.circular(4.0),
+                          ),
+                          child: Text(
+                            'Unread',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.orange.shade800,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      const SizedBox(width: 8),
+                      const Icon(
+                        Icons.open_in_new,
+                        size: 16,
+                        color: Colors.blue,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // NEW: Show feedback detail dialog
+  void _showFeedbackDetailDialog(FeedbackItem feedback) {
+    final categoryColor = _getFeedbackCategoryColor(feedback.category);
+    final formattedDate = DateFormat(
+      'MMMM d, yyyy • hh:mm a',
+    ).format(feedback.timestamp);
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        scrollable: true,
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('Feedback Details'),
+            Chip(
+              label: Text(
+                feedback.category,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              backgroundColor: categoryColor.withOpacity(0.2),
+              labelStyle: TextStyle(color: categoryColor),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // User Info Section
+            Card(
+              color: Colors.grey[50],
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'From',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black54,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      feedback.userName,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      feedback.userPhone,
+                      style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            // Feedback Text Section
+            const Text(
+              'Feedback',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+                color: Colors.black54,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(12.0),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(8.0),
+                border: Border.all(color: Colors.blue.shade200),
+              ),
+              child: Text(
+                feedback.feedbackText,
+                style: const TextStyle(fontSize: 15, height: 1.6),
+              ),
+            ),
+            const SizedBox(height: 16),
+            // Timestamp Section
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Received',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black54,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      formattedDate,
+                      style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                    ),
+                  ],
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    const Text(
+                      'Status',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black54,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: feedback.status == 'unread'
+                            ? Colors.orange.shade100
+                            : Colors.green.shade100,
+                        borderRadius: BorderRadius.circular(4.0),
+                      ),
+                      child: Text(
+                        feedback.status == 'unread' ? 'Unread' : 'Read',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: feedback.status == 'unread'
+                              ? Colors.orange.shade800
+                              : Colors.green.shade800,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+          if (feedback.status == 'unread')
+            ElevatedButton.icon(
+              onPressed: () async {
+                try {
+                  // Mark as read in admin_feedback collection
+                  await FirebaseFirestore.instance
+                      .collection('admin_feedback')
+                      .doc(feedback.id)
+                      .update({'status': 'read'});
+
+                  // Also update in guardians subcollection if it exists
+                  try {
+                    final guardianDocs = await FirebaseFirestore.instance
+                        .collection('guardians')
+                        .get();
+
+                    for (var guardianDoc in guardianDocs.docs) {
+                      final feedbackRef = guardianDoc.reference
+                          .collection('feedback')
+                          .doc(feedback.id);
+
+                      final docExists = await feedbackRef.get();
+                      if (docExists.exists) {
+                        await feedbackRef.update({'status': 'read'});
+                        break;
+                      }
+                    }
+                  } catch (e) {
+                    print('Note: Could not update guardians subcollection: $e');
+                  }
+
+                  if (mounted) {
+                    Navigator.pop(context);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('✅ Feedback marked as read'),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  print('Error marking feedback as read: $e');
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('❌ Error marking as read: $e'),
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                  }
+                }
+              },
+              icon: const Icon(Icons.check_circle),
+              label: const Text('Mark as Read'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // NEW: Get color for feedback category
+  Color _getFeedbackCategoryColor(String category) {
+    switch (category) {
+      case 'Bug Report':
+        return Colors.red;
+      case 'Feature Request':
+        return Colors.green;
+      case 'General':
+        return Colors.blue;
+      default:
+        return Colors.grey;
+    }
+  }
+
   Color _getAlertColor(String status) {
     switch (status.toLowerCase()) {
       case 'panic':
@@ -1325,27 +1936,75 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     );
   }
 
-  // NEW: Get filtered alerts based on selected period
+  // NEW: Get filtered alerts based on selected period and date
   List<PanicAlert> _getFilteredAlerts() {
-    final now = DateTime.now();
     DateTime startDate;
+    DateTime endDate;
 
     switch (_selectedPeriod) {
       case 'Week':
-        startDate = now.subtract(const Duration(days: 7));
+        // Start from selected date, go back 6 days (7 days total)
+        startDate = _selectedReportDate.subtract(const Duration(days: 6));
+        startDate = DateTime(startDate.year, startDate.month, startDate.day);
+        // End date is the selected date (end of day)
+        endDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          _selectedReportDate.day,
+          23,
+          59,
+          59,
+        );
         break;
       case 'Month':
-        startDate = DateTime(now.year, now.month, 1);
+        // Start from first day of month
+        startDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          1,
+        );
+        // End date is the last day of the month
+        final nextMonth = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month + 1,
+          1,
+        );
+        endDate = nextMonth.subtract(const Duration(days: 1));
+        endDate = DateTime(
+          endDate.year,
+          endDate.month,
+          endDate.day,
+          23,
+          59,
+          59,
+        );
         break;
       case 'Year':
-        startDate = DateTime(now.year, 1, 1);
+        // Start from first day of year
+        startDate = DateTime(_selectedReportDate.year, 1, 1);
+        // End date is the last day of the year (December 31)
+        endDate = DateTime(_selectedReportDate.year, 12, 31, 23, 59, 59);
         break;
       default:
-        startDate = now.subtract(const Duration(days: 7));
+        startDate = _selectedReportDate.subtract(const Duration(days: 6));
+        startDate = DateTime(startDate.year, startDate.month, startDate.day);
+        endDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          _selectedReportDate.day,
+          23,
+          59,
+          59,
+        );
     }
 
     final startTimestamp = startDate.millisecondsSinceEpoch;
-    final endTimestamp = now.millisecondsSinceEpoch;
+    final endTimestamp = endDate.millisecondsSinceEpoch;
+
+    print('Filter period: $_selectedPeriod');
+    print('Selected date: $_selectedReportDate');
+    print('Start: $startDate ($startTimestamp)');
+    print('End: $endDate ($endTimestamp)');
 
     return _allAlerts.where((alert) {
       if (alert.timestamp == 0) return false;
@@ -1357,22 +2016,46 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
   // NEW: Build reports view
   Widget _buildReportsView() {
     final filteredAlerts = _getFilteredAlerts();
-    final now = DateTime.now();
+
+    // Calculate date range based on selected period and date
     DateTime startDate;
-    DateTime endDate = now;
+    DateTime endDate;
 
     switch (_selectedPeriod) {
       case 'Week':
-        startDate = now.subtract(const Duration(days: 7));
+        startDate = _selectedReportDate.subtract(const Duration(days: 6));
+        startDate = DateTime(startDate.year, startDate.month, startDate.day);
+        endDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          _selectedReportDate.day,
+        );
         break;
       case 'Month':
-        startDate = DateTime(now.year, now.month, 1);
+        startDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          1,
+        );
+        final nextMonth = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month + 1,
+          1,
+        );
+        endDate = nextMonth.subtract(const Duration(days: 1));
         break;
       case 'Year':
-        startDate = DateTime(now.year, 1, 1);
+        startDate = DateTime(_selectedReportDate.year, 1, 1);
+        endDate = DateTime(_selectedReportDate.year, 12, 31);
         break;
       default:
-        startDate = now.subtract(const Duration(days: 7));
+        startDate = _selectedReportDate.subtract(const Duration(days: 6));
+        startDate = DateTime(startDate.year, startDate.month, startDate.day);
+        endDate = DateTime(
+          _selectedReportDate.year,
+          _selectedReportDate.month,
+          _selectedReportDate.day,
+        );
     }
 
     // Calculate statistics
@@ -1400,6 +2083,83 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
           Text(
             '${DateFormat('MMM d, yyyy').format(startDate)} - ${DateFormat('MMM d, yyyy').format(endDate)}',
             style: const TextStyle(fontSize: 14, color: Colors.black54),
+          ),
+          const SizedBox(height: 16),
+          // Date Picker Button
+          Container(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.grey.withOpacity(0.1),
+                  spreadRadius: 1,
+                  blurRadius: 5,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () async {
+                  final pickedDate = await showDatePicker(
+                    context: context,
+                    initialDate: _selectedReportDate,
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime.now(),
+                  );
+                  if (pickedDate != null) {
+                    setState(() {
+                      _selectedReportDate = pickedDate;
+                    });
+                  }
+                },
+                borderRadius: BorderRadius.circular(12),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.calendar_today,
+                            color: Colors.green,
+                            size: 22,
+                          ),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'Report End Date',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black54,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                DateFormat(
+                                  'MMMM d, yyyy',
+                                ).format(_selectedReportDate),
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.black87,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                      const Icon(Icons.edit, color: Colors.grey, size: 20),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: 24),
           // Period Selector
